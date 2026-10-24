@@ -88,6 +88,7 @@ def _is_emojiish(ch: str) -> bool:
         ch in "\ufe0f\u200d" or ch.isspace()
         or 0x1F000 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF
         or 0x2B00 <= o <= 0x2BFF or 0x2190 <= o <= 0x21FF or 0x1800 <= o <= 0x18AF
+        or 0x2300 <= o <= 0x23FF or 0x25A0 <= o <= 0x25FF  # ⏹⏸⏭⏩ · ▶◀ + shapes
     )
 
 
