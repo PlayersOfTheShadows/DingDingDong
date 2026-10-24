@@ -1,0 +1,482 @@
+"""yt-dlp wrapper: search, metadata, stream resolution (with player-client
+fallback + HTTP verification) and the download fallback used when a live
+stream dies mid-playback.
+"""
+from __future__ import annotations
+
+import asyncio
+import functools
+import logging
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+import aiohttp
+import yt_dlp
+
+from . import config
+
+log = logging.getLogger("bot.ytdl")
+
+# Player-client fallback order for YouTube extraction. "" = yt-dlp default.
+# Which clients survive changes every few weeks — run tools/test_youtube.py to
+# print the current matrix for this machine, and reorder here if it shifts again.
+STREAM_CLIENTS: list[str] = ["", "android_vr", "tv_embedded", "android", "tv", "web_safari", "web_embedded", "mweb", "ios"]
+# Second-pass clients: the checks are probabilistic, so after a short pause the
+# top clients are retried once before giving up.
+RETRY_CLIENTS: list[str] = ["", "android_vr", "tv_embedded"]
+# Errors that mean "stop retrying": the video itself is gone/restricted.
+PERMANENT_ERROR_HINTS = ("video unavailable", "private video", "has been removed", "members-only", "does not exist")
+
+UNSUPPORTED_DOMAINS = {
+    "open.spotify.com": "Spotify",
+    "spotify.link": "Spotify",
+    "music.apple.com": "Apple Music",
+    "deezer.com": "Deezer",
+    "tidal.com": "Tidal",
+    "music.amazon.": "Amazon Music",
+}
+
+AUDIO_EXTENSIONS = (".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".flac", ".wav", ".webm")
+RADIO_HINTS = ("somafm.com", "radioparadise.com", "icecast", ":8000", "/stream")
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class ExtractError(Exception):
+    """Extraction failed or returned nothing usable."""
+
+
+class UnsupportedPlatform(Exception):
+    """Link points at a platform we cannot stream from directly."""
+
+
+class StreamError(Exception):
+    """No playable stream URL could be resolved."""
+
+
+def _clean_error(text: str) -> str:
+    text = _ANSI_RE.sub("", text or "")
+    text = text.replace("ERROR: ", "").strip()
+    if len(text) > 220:
+        text = text[:219] + "…"
+    return text or "unknown extraction error"
+
+
+@dataclass
+class Track:
+    title: str
+    webpage_url: str
+    duration: Optional[int] = None
+    thumbnail: Optional[str] = None
+    uploader: Optional[str] = None
+    requester_id: Optional[int] = None
+    requester_name: str = ""
+    is_live: bool = False
+    direct_stream: bool = False
+    video_id: Optional[str] = None
+    stream_url: Optional[str] = None
+    stream_at: float = 0.0
+    http_headers: dict = field(default_factory=dict)
+    fallback_done: bool = False
+
+    # ---------------- construction ----------------
+
+    @classmethod
+    def from_info(cls, info: dict, *, requester=None, direct: bool = False) -> "Track":
+        webpage = (
+            info.get("webpage_url")
+            or info.get("original_url")
+            or (info.get("url") if direct else None)
+            or ""
+        )
+        thumb = info.get("thumbnail")
+        if not thumb:
+            thumbs = info.get("thumbnails") or []
+            if thumbs:
+                thumb = thumbs[-1].get("url")
+        duration = info.get("duration")
+        return cls(
+            title=info.get("title") or "Unknown title",
+            webpage_url=webpage,
+            duration=int(duration) if duration else None,
+            thumbnail=thumb,
+            uploader=info.get("uploader") or info.get("channel") or info.get("artist"),
+            requester_id=getattr(requester, "id", None),
+            requester_name=(getattr(requester, "display_name", None) or getattr(requester, "name", "") or ""),
+            is_live=bool(info.get("is_live")),
+            direct_stream=direct,
+            video_id=info.get("id"),
+            stream_url=info.get("url") if direct else None,
+            http_headers=info.get("http_headers") or {},
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "title": self.title,
+            "webpage_url": self.webpage_url,
+            "duration": self.duration,
+            "thumbnail": self.thumbnail,
+            "uploader": self.uploader,
+            "requester_id": self.requester_id,
+            "requester_name": self.requester_name,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Track":
+        return cls(
+            title=data.get("title") or "Unknown title",
+            webpage_url=data.get("webpage_url") or "",
+            duration=data.get("duration"),
+            thumbnail=data.get("thumbnail"),
+            uploader=data.get("uploader"),
+            requester_id=data.get("requester_id"),
+            requester_name=data.get("requester_name") or "",
+        )
+
+    @property
+    def source_url(self) -> str:
+        if self.webpage_url:
+            return self.webpage_url
+        if self.video_id:
+            return f"https://www.youtube.com/watch?v={self.video_id}"
+        return ""
+
+
+class Resolver:
+    """Runs yt-dlp (synchronous) inside a small thread pool."""
+
+    def __init__(self) -> None:
+        self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ytdlp")
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
+        self.working_client: Optional[str] = None
+
+    # ---------------- lifecycle ----------------
+
+    async def session(self) -> aiohttp.ClientSession:
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                )
+            return self._session
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._pool.shutdown(wait=False)
+
+    # ---------------- sync core ----------------
+
+    def _opts(
+        self,
+        *,
+        client: Optional[str] = None,
+        flat: Any = None,
+        playlist: bool = False,
+        extra: Optional[dict] = None,
+    ) -> dict:
+        opts: dict = {
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "noplaylist": not playlist,
+            "default_search": "ytsearch",
+            "skip_download": True,
+            "format": "bestaudio[acodec=opus]/bestaudio/bestaudio*/best",
+            "socket_timeout": 20,
+            "retries": 2,
+            "cachedir": str(config.YTDLP_CACHE_DIR),
+        }
+        cookies = config.YTDLP_COOKIES_FROM_BROWSER
+        if cookies:
+            browser = "firefox" if cookies == "auto" else cookies
+            opts["cookiesfrombrowser"] = (browser,)
+        if flat is not None:
+            opts["extract_flat"] = flat
+        if client:
+            opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+        if extra:
+            opts.update(extra)
+        return opts
+
+    def _extract_sync(
+        self,
+        target: str,
+        *,
+        client: Optional[str] = None,
+        flat: Any = None,
+        playlist: bool = False,
+        extra: Optional[dict] = None,
+    ) -> dict:
+        with yt_dlp.YoutubeDL(self._opts(client=client, flat=flat, playlist=playlist, extra=extra)) as ydl:
+            info = ydl.extract_info(target, download=False)
+        if not isinstance(info, dict):
+            raise ExtractError("Extractor returned no data.")
+        entries = info.get("entries")
+        if entries is not None:
+            entries = [e for e in entries if isinstance(e, dict)]
+            if not entries:
+                raise ExtractError("No results found.")
+            if playlist:
+                info["entries"] = entries
+                return info
+            return entries[0]
+        return info
+
+    async def _extract(self, target: str, **kwargs) -> dict:
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(
+                self._pool, functools.partial(self._extract_sync, target, **kwargs)
+            )
+        except ExtractError:
+            raise
+        except yt_dlp.utils.DownloadError as exc:
+            raise ExtractError(_clean_error(str(exc))) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise ExtractError(_clean_error(f"{type(exc).__name__}: {exc}")) from exc
+
+    @staticmethod
+    def _is_permanent_error(message: str) -> bool:
+        low = (message or "").lower()
+        return any(hint in low for hint in PERMANENT_ERROR_HINTS)
+
+    async def _flat_search(self, target: str) -> dict:
+        """Flat search with one client-retry: searches hit the same bot-checks
+        as playback."""
+        try:
+            return await self._extract(target, flat=True, playlist=True)
+        except ExtractError as exc:
+            if self._is_permanent_error(str(exc)):
+                raise
+            return await self._extract(target, client="android_vr", flat=True, playlist=True)
+
+    # ---------------- public API ----------------
+
+    @staticmethod
+    def is_url(text: str) -> bool:
+        return text.startswith("http://") or text.startswith("https://")
+
+    @staticmethod
+    def _is_direct_audio(url: str) -> bool:
+        low = url.lower()
+        path = low.split("?", 1)[0]
+        return path.endswith(AUDIO_EXTENSIONS) or any(h in low for h in RADIO_HINTS)
+
+    @staticmethod
+    def _is_playlist_url(low: str) -> bool:
+        if "/playlist" in low:
+            return True
+        if "list=" in low and "watch?v=" not in low:
+            return True
+        return False
+
+    async def search(self, query: str, limit: int = 5) -> list["Track"]:
+        info = await self._flat_search(f"ytsearch{limit}:{query}")
+        out = []
+        for entry in info.get("entries", []):
+            if entry.get("title"):
+                out.append(Track.from_info(entry))
+        return out
+
+    async def resolve(
+        self,
+        query: str,
+        *,
+        requester=None,
+        playlist_limit: Optional[int] = None,
+    ) -> tuple[str, list["Track"]]:
+        """Returns (kind, tracks) where kind is 'track' or 'playlist'."""
+        q = (query or "").strip()
+        if not q:
+            raise ExtractError("Empty search query.")
+        limit = playlist_limit or config.PLAYLIST_URL_LIMIT
+        if self.is_url(q):
+            return await self._resolve_url(q, requester=requester, playlist_limit=limit)
+        info = await self._flat_search(f"ytsearch1:{q}")
+        entries = info.get("entries") or []
+        if not entries:
+            raise ExtractError(f"No results for `{q}`.")
+        return "track", [Track.from_info(entries[0], requester=requester)]
+
+    async def _resolve_url(self, url: str, *, requester, playlist_limit: int) -> tuple[str, list["Track"]]:
+        low = url.lower()
+        for domain, platform in UNSUPPORTED_DOMAINS.items():
+            if domain in low:
+                raise UnsupportedPlatform(
+                    f"{platform} links can't be streamed directly yet — search by song name instead."
+                )
+        if self._is_direct_audio(url):
+            title = url.rstrip("/").split("/")[-1].split("?")[0] or url
+            return "track", [Track(title=title, webpage_url=url, direct_stream=True, is_live=True)]
+        if self._is_playlist_url(low):
+            info = await self._extract(
+                url, flat=True, playlist=True, extra={"playlistend": max(1, playlist_limit)}
+            )
+            tracks = [Track.from_info(e, requester=requester) for e in info.get("entries", []) if e.get("title")]
+            if not tracks:
+                raise ExtractError("That playlist is empty or private.")
+            return "playlist", tracks
+        info = await self._extract(url)
+        return "track", [Track.from_info(info, requester=requester)]
+
+    # ---------------- stream resolution ----------------
+
+    async def verify(self, url: str, headers: dict) -> tuple[bool, str]:
+        """Quick HTTP check that the stream URL actually serves audio."""
+        try:
+            session = await self.session()
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                if resp.status not in (200, 206):
+                    return False, f"HTTP {resp.status}"
+                chunk = await resp.content.read(32768)
+                if not chunk:
+                    return False, "empty response body"
+                return True, "ok"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"{type(exc).__name__}: {exc}"
+
+    async def get_stream(self, track: "Track") -> tuple[str, dict, dict]:
+        """Resolve (stream_url, http_headers, fresh_info).
+
+        Pass 1: every client in STREAM_CLIENTS (the last one that worked first).
+        Pass 2: if everything failed with a *soft* error (bot-check / format
+        churn — these checks are probabilistic), retry the top clients once
+        after a short pause before giving up."""
+        if track.direct_stream:
+            return track.webpage_url, track.http_headers or {}, {}
+        target = track.source_url
+        if not target:
+            raise StreamError("Track has no source URL.")
+        clients: list[str] = []
+        if self.working_client is not None:
+            clients.append(self.working_client)
+        clients += [c for c in STREAM_CLIENTS if c != self.working_client]
+        last_err: Optional[Exception] = None
+        for pass_no in (1, 2):
+            client_list = clients if pass_no == 1 else [c for c in RETRY_CLIENTS if c != self.working_client]
+            for client in client_list:
+                label = client or "(default)"
+                try:
+                    info = await self._extract(target, client=client)
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+                    log.debug("pass %d: extract failed for client %s: %r", pass_no, label, exc)
+                    continue
+                url = info.get("url")
+                if not url:
+                    last_err = StreamError("extraction returned no direct audio URL")
+                    continue
+                headers = info.get("http_headers") or {}
+                ok, detail = await self.verify(url, headers)
+                if not ok:
+                    last_err = StreamError(f"stream check failed: {detail}")
+                    log.debug("pass %d: verify failed for client %s: %s", pass_no, label, detail)
+                    continue
+                if self.working_client != client:
+                    self.working_client = client
+                    log.info("using youtube player client: %s", label)
+                return url, headers, info
+            if pass_no == 1:
+                if self._is_permanent_error(str(last_err)):
+                    break
+                log.info("all clients failed once (%s) — retrying top clients", last_err)
+                await asyncio.sleep(2.5)
+        raise StreamError(f"no playable stream found ({last_err})")
+
+    async def sc_fallback(self, track: "Track") -> Optional["Track"]:
+        """SoundCloud search for the same song — the cookie-free rescue path
+        when YouTube bot-walls every client. Picks the result whose duration
+        best matches the original (SoundCloud search loves 30s clips)."""
+        query = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", track.title or "")
+        query = re.sub(r"\s+", " ", query).strip(" -–—|")
+        if track.uploader and track.uploader.lower() not in query.lower():
+            query = f"{query} {track.uploader}".strip()
+        if not query:
+            return None
+        try:
+            info = await self._extract(f"scsearch5:{query}", flat=True, playlist=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("soundcloud fallback search failed: %r", exc)
+            return None
+        candidates = [Track.from_info(e) for e in info.get("entries") or [] if e.get("title")]
+        if not candidates:
+            return None
+        for cand in candidates:  # normalize odd ms durations defensively
+            if cand.duration and cand.duration > 20000:
+                cand.duration = cand.duration // 1000
+        if track.duration:
+            with_dur = [t for t in candidates if t.duration]
+            best = min(with_dur, key=lambda t: abs(t.duration - track.duration)) if with_dur else candidates[0]
+        else:
+            best = next((t for t in candidates if t.duration and t.duration >= 60), candidates[0])
+        best.requester_id = track.requester_id
+        best.requester_name = track.requester_name
+        return best
+
+    # ---------------- download fallback ----------------
+
+    def _download_sync(self, track: "Track") -> Path:
+        opts = self._opts(
+            client=self.working_client,
+            extra={
+                "skip_download": False,
+                "outtmpl": str(config.CACHE_DIR / "dl_%(id)s.%(ext)s"),
+            },
+        )
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(track.source_url, download=True)
+        path = Path(ydl.prepare_filename(info))
+        if not path.exists():
+            matches = sorted(
+                config.CACHE_DIR.glob(f"dl_{info.get('id')}.*"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if matches:
+                path = matches[0]
+        if not path.exists():
+            raise StreamError("download produced no file")
+        return path
+
+    async def download(self, track: "Track") -> Path:
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(self._pool, functools.partial(self._download_sync, track))
+        except ExtractError:
+            raise
+        except yt_dlp.utils.DownloadError as exc:
+            raise StreamError(_clean_error(str(exc))) from exc
+
+    # ---------------- autoplay ----------------
+
+    async def related(self, track: "Track", limit: int = 5, *, seen: Optional[set] = None) -> list["Track"]:
+        """YouTube mix seeded by the given track, minus already-played videos."""
+        seen = seen or set()
+        vid = track.video_id
+        if not vid:
+            return []
+        target = f"https://www.youtube.com/watch?v={vid}&list=RD{vid}"
+        try:
+            info = await self._extract(target, flat=True, playlist=True, extra={"playlistend": 25})
+        except Exception as exc:  # noqa: BLE001
+            log.warning("autoplay mix extraction failed: %r", exc)
+            return []
+        out: list["Track"] = []
+        for entry in info.get("entries") or []:
+            eid = entry.get("id")
+            if not eid or eid == vid or eid in seen or not entry.get("title"):
+                continue
+            t = Track.from_info(entry)
+            t.requester_id = track.requester_id
+            t.requester_name = track.requester_name or "Autoplay"
+            out.append(t)
+            if len(out) >= limit:
+                break
+        return out
