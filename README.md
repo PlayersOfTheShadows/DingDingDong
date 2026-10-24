@@ -109,6 +109,19 @@ Prefix short forms (like Luna/Flavi): `!p` `!ps` `!pt` `!q` `!np` `!s` `!r` `!vo
 - Spotify/Apple/Deezer links aren't supported directly (they need platform API keys) —
   search by song name instead. Radio stations and direct audio/stream URLs work.
 
+## Deploying to a hosting panel (bot-hosting.net)
+
+The panel pulls straight from GitHub → **https://github.com/PlayersOfTheShadows/DingDingDong** (public, `main`).
+
+Panel settings:
+
+- **Runtime:** `Python` — version **3.12** (the tested version; 3.11/3.13/3.14 also fine).
+- **Main file / start:** `main.py` (the root shim) — or in a console: `python -m bot.main`.
+- **Install:** `pip install -r requirements.txt` — includes `discord.py[voice]` → **davey**, which voice refuses to start without.
+- **Environment:** upload your local `.env` (file manager / SFTP) or set the same values as environment variables in the panel. `DISCORD_TOKEN` is the only strictly required one.
+- **ffmpeg:** the repo ships no binaries; the bot uses system `ffmpeg` when `bin/` is absent, so a host with ffmpeg preinstalled just works. If voice connects but is silent, run `ffmpeg -version` in the panel console; if missing, upload a static Linux ffmpeg to `bin/ffmpeg` — it is picked up automatically.
+- Only one instance per token — stop the local copy before the hosted one comes online.
+
 ## Troubleshooting
 
 | Symptom | Fix |
