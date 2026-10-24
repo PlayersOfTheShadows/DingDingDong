@@ -13,7 +13,7 @@ from typing import Optional
 import discord
 
 from . import config
-from .store import add_history, guild_settings
+from .store import add_history, get_history, guild_settings, set_setting, user_playlists
 from .utils import fmt_duration, friendly_stream_error, np_embed, sanitize
 from .views import NowPlayingView
 from .ytdl import ExtractError, StreamError, Track
@@ -37,6 +37,12 @@ FILTERS: dict[str, Optional[str]] = {
     "treble": "treble=g=6",
     "lofi": "lowpass=f=3200",
     "karaoke": "pan=stereo|c0=c0|c1=-1*c1",
+    "deep": "aresample=48000,asetrate=40800,aresample=48000,atempo=1.176",
+    "chipmunk": "aresample=48000,asetrate=66000,aresample=48000,atempo=0.727",
+    "earrape": "volume=6",
+    "dance": "bass=g=5,treble=g=3,aecho=0.8:0.9:40:0.3",
+    "party": "aecho=0.8:0.88:60:0.4,acompressor",
+    "soft": "volume=0.85,treble=g=-3,bass=g=3",
 }
 
 
@@ -182,11 +188,28 @@ class GuildPlayer:
         self.queue = deque(q)
         return track
 
+    def jump_to(self, position: int) -> Track:
+        """Drop everything before `position` and return the track that plays next."""
+        q = list(self.queue)
+        if not q:
+            raise UserError("The queue is empty.")
+        if not (1 <= position <= len(q)):
+            raise UserError(f"Position must be between 1 and {len(q)}.")
+        for _ in range(position - 1):
+            skipped = self.queue.popleft()
+            self.history.append(skipped)
+        del self.history[:-100]
+        return self.queue[0]
+
     # ------------------------------------------------------------------ runner
 
     def _cancel_idle_watchdog(self) -> None:
-        if self._idle_watchdog is not None and not self._idle_watchdog.done():
-            self._idle_watchdog.cancel()
+        task = self._idle_watchdog
+        # Never cancel the watchdog from inside itself: disconnect() calls this
+        # while running inside the watchdog task, and self-cancellation would
+        # abort the disconnect before the voice client actually leaves.
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
         self._idle_watchdog = None
 
     async def start(self) -> None:
@@ -223,7 +246,7 @@ class GuildPlayer:
                 err = await self._play_track(track, seek=seek)
             except (StreamError, ExtractError, UserError) as exc:
                 log.warning("playback failed in guild %s for %r: %s", self.guild.id, track.title, exc)
-                await self._notice(f"⚠️ Couldn't play **{sanitize(track.title)}** — {friendly_stream_error(str(exc))}")
+                await self._notice(f"Couldn't play **{sanitize(track.title)}** — {friendly_stream_error(str(exc))}")
                 continue
             except asyncio.CancelledError:
                 raise
@@ -247,13 +270,7 @@ class GuildPlayer:
 
     async def _next_track(self) -> Optional[Track]:
         if not self.queue and self.autoplay and self.current is not None:
-            try:
-                related = await self.bot.resolver.related(self.current, 5, seen=self._autoplay_seen)
-                self.queue.extend(related)
-                if related:
-                    await self._notice("✨ Autoplay queued 5 related tracks.")
-            except Exception:
-                log.debug("autoplay fetch failed", exc_info=True)
+            self.queue.extend(await self._autoplay_fill())
         if not self.queue:
             self.current = None
             return None
@@ -268,6 +285,50 @@ class GuildPlayer:
         except Exception:
             log.debug("history save failed", exc_info=True)
         return track
+
+    async def _autoplay_fill(self) -> list[Track]:
+        """Queue sources when the queue runs dry: AI suggestion first (based on
+        the listener's recent tracks and playlists), classic YouTube mix as fallback."""
+        current = self.current
+        if current is None:
+            return []
+        ai = getattr(self.bot, "ai", None)
+        if ai is not None and ai.available:
+            try:
+                seed_id = current.requester_id
+                hist = get_history(self.guild.id, 80)
+                recent = [h.get("title") or "" for h in hist if seed_id and h.get("requester_id") == seed_id][:10]
+                if not recent:
+                    recent = [h.get("title") or "" for h in hist][:10]
+                pl_songs: list[str] = []
+                if seed_id:
+                    for pl in list(user_playlists(seed_id).values())[:3]:
+                        pl_songs += [t.get("title") or "" for t in (pl.get("tracks") or [])][:15]
+                query = await ai.suggest_track(recent=recent, playlists=pl_songs, current=current.title)
+                if query:
+                    track: Optional[Track] = None
+                    try:
+                        kind, tracks = await self.bot.resolver.resolve(query, requester=None)
+                        if kind == "track" and tracks:
+                            track = tracks[0]
+                    except ExtractError:
+                        track = await self.bot.resolver.sc_search(query)
+                    if track is not None:
+                        track.requester_id = current.requester_id
+                        track.requester_name = current.requester_name or "Autoplay"
+                        await self._notice(
+                            f"Autoplay picked **{sanitize(track.title)}** ({ai.last_label or 'AI'})."
+                        )
+                        return [track]
+            except Exception:
+                log.debug("ai autoplay failed", exc_info=True)
+        try:
+            related = await self.bot.resolver.related(current, 5, seen=self._autoplay_seen)
+        except Exception:
+            return []
+        if related:
+            await self._notice("Autoplay queued 5 related tracks.")
+        return related
 
     # ------------------------------------------------------------------ playback
 
@@ -333,7 +394,7 @@ class GuildPlayer:
                 if fallback is None:
                     raise
                 await self._notice(
-                    f"⚠️ YouTube is blocking **{sanitize(track.title)}** — playing **{sanitize(fallback.title)}** from SoundCloud instead."
+                    f"YouTube is blocking **{sanitize(track.title)}** — playing **{sanitize(fallback.title)}** from SoundCloud instead."
                 )
                 track = fallback
                 url, headers, fresh = await self.bot.resolver.get_stream(track)
@@ -383,22 +444,22 @@ class GuildPlayer:
         """One download-based retry per track. Returns True if handled."""
         if track.fallback_done or track.direct_stream:
             log.warning("playback failed twice in guild %s for %r: %r", self.guild.id, track.title, err)
-            await self._notice(f"⚠️ Playback of **{sanitize(track.title)}** failed — skipping. {friendly_stream_error(str(err))}")
+            await self._notice(f"Playback of **{sanitize(track.title)}** failed — skipping. {friendly_stream_error(str(err))}")
             return False
         track.fallback_done = True
         track.stream_url = None
-        await self._notice(f"⚠️ Stream died for **{sanitize(track.title)}** — retrying via download…")
+        await self._notice(f"Stream died for **{sanitize(track.title)}** — retrying via download…")
         try:
             path = await self.bot.resolver.download(track)
         except Exception as exc:  # noqa: BLE001
             log.warning("download fallback failed: %r", exc)
-            await self._notice(f"⚠️ Download fallback failed — skipping **{sanitize(track.title)}**.")
+            await self._notice(f"Download fallback failed — skipping **{sanitize(track.title)}**.")
             return False
         try:
             err2 = await self._play_local(track, path)
             if err2 is None:
                 return True
-            await self._notice(f"⚠️ Playback failed again — skipping **{sanitize(track.title)}**.")
+            await self._notice(f"Playback failed again — skipping **{sanitize(track.title)}**.")
             return False
         finally:
             try:
@@ -454,6 +515,10 @@ class GuildPlayer:
         level = max(1, min(200, int(level)))
         self._volume = level / 100.0
         self._soft_restart()
+        try:
+            set_setting(self.guild.id, "default_volume", level)
+        except Exception:
+            pass
 
     async def set_filter(self, name: str) -> None:
         key = (name or "").strip().lower()
@@ -543,6 +608,7 @@ class GuildPlayer:
             self._notice_channel = None
 
     async def _announce_track(self, track: Track) -> None:
+        self.bot._songs_played = getattr(self.bot, "_songs_played", 0) + 1
         settings = guild_settings(self.guild.id)
         if settings.get("announce", True) and self._notice_channel is not None:
             try:
@@ -555,7 +621,7 @@ class GuildPlayer:
                     queue_len=len(self.queue),
                     autoplay=self.autoplay,
                 )
-                self._np_message = await self._notice_channel.send(embed=e, view=NowPlayingView(self))
+                self._np_message = await self._notice_channel.send(embed=e, view=NowPlayingView(self, compact=True))
             except Exception:
                 self._np_message = None
         if settings.get("songstatus", True):
@@ -565,7 +631,7 @@ class GuildPlayer:
         vc = self.vc
         if vc is None or vc.channel is None:
             return
-        text = f"🎶 {sanitize(track.title, 200)}"[:500] if track is not None else None
+        text = sanitize(track.title, 90)[:500] if track is not None else None
         try:
             await vc.channel.edit(status=text)
         except Exception:
@@ -589,11 +655,11 @@ class GuildPlayer:
                 humans = [m for m in (vc.channel.members if vc.channel else []) if not m.bot]
                 idle = time.monotonic() - started
                 if not humans and idle >= config.EMPTY_CHANNEL_SECONDS:
-                    await self._notice("👋 Nobody is left in the channel — disconnecting.")
+                    await self._notice("Nobody is left in the channel — disconnecting.")
                     await self.disconnect()
                     return
                 if idle >= config.IDLE_LEAVE_SECONDS:
-                    await self._notice("👋 I've been idle for too long — disconnecting. (Enable **24/7** to keep me here.)")
+                    await self._notice("I've been idle for too long — disconnecting. (Enable **24/7** to keep me here.)")
                     await self.disconnect()
                     return
         except asyncio.CancelledError:

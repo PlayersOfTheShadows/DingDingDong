@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import random
+import time
 from collections import deque
 from typing import Optional
 
@@ -43,6 +44,29 @@ RADIO_STATIONS: list[tuple[str, str]] = [
     ("Radio Paradise Main Mix", "https://stream.radioparadise.com/mp3-192"),
     ("Radio Paradise Mellow Mix", "https://stream.radioparadise.com/mellow-192"),
 ]
+
+
+# ------------------------------------------------------------------ autocomplete
+
+async def play_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    """Flavi-style: live song suggestions above the text bar while typing /play."""
+    try:
+        pairs = await interaction.client.resolver.suggest(current or "", limit=8)
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[app_commands.Choice[str]] = []
+    seen: set[str] = set()
+    for label, value in pairs:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(app_commands.Choice(name=label[:100], value=value[:100]))
+    return out[:25]
+
+
+async def filter_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    low = (current or "").strip().lower()
+    return [app_commands.Choice(name=key, value=key) for key in FILTERS if low in key][:25]
 
 
 class SearchView(discord.ui.View):
@@ -86,7 +110,7 @@ class SearchView(discord.ui.View):
         pos = player.enqueue(track)
         await player.start()
         await interaction.response.send_message(
-            embed=track_embed(track, title="➕ Added to queue", position=pos), ephemeral=True
+            embed=track_embed(track, title="Added to queue", position=pos), ephemeral=True
         )
 
 
@@ -144,18 +168,21 @@ class Music(commands.Cog):
     @commands.hybrid_command(name="play", aliases=["p"], description="Play a song by name or URL (adds to the queue while something plays).")
     @commands.guild_only()
     @app_commands.describe(query="Song name, YouTube URL or playlist URL", insert_first="Put this right after the current track")
+    @app_commands.autocomplete(query=play_autocomplete)
     async def play(self, ctx: commands.Context, *, query: str, insert_first: bool = False):
         await self._do_play(ctx, query, insert_first=insert_first, then_skip=False)
 
     @commands.hybrid_command(name="playskip", aliases=["ps"], description="Queue a song and skip straight to it.")
     @commands.guild_only()
     @app_commands.describe(query="Song name, YouTube URL or playlist URL")
+    @app_commands.autocomplete(query=play_autocomplete)
     async def playskip(self, ctx: commands.Context, *, query: str):
         await self._do_play(ctx, query, insert_first=True, then_skip=True)
 
     @commands.hybrid_command(name="playtop", aliases=["pt"], description="Add a song to the top of the queue.")
     @commands.guild_only()
     @app_commands.describe(query="Song name, YouTube URL or playlist URL")
+    @app_commands.autocomplete(query=play_autocomplete)
     async def playtop(self, ctx: commands.Context, *, query: str):
         await self._do_play(ctx, query, insert_first=True, then_skip=False)
 
@@ -178,7 +205,7 @@ class Music(commands.Cog):
         )
         pos = player.enqueue(track)
         await player.start()
-        await ctx.send(embed=track_embed(track, title="➕ Added to queue", position=pos))
+        await ctx.send(embed=track_embed(track, title="Added to queue", position=pos))
 
     async def _do_play(self, ctx, query: str, *, insert_first: bool, then_skip: bool):
         await self._defer(ctx)
@@ -203,7 +230,7 @@ class Music(commands.Cog):
                 ) from exc
             kind, tracks = "track", [sc_track]
             await player._notice(
-                f"⚠️ YouTube returned nothing playable — using **{sanitize(sc_track.title)}** from SoundCloud instead."
+                f"YouTube returned nothing playable — using **{sanitize(sc_track.title)}** from SoundCloud instead."
             )
         if kind == "track":
             track = tracks[0]
@@ -212,16 +239,16 @@ class Music(commands.Cog):
             if then_skip:
                 await player.skip()
             if then_skip or insert_first:
-                title = "⏭ Playing next"
+                title = "Playing next"
             elif was_idle:
-                title = "▶️ Playing"
+                title = "Playing"
             else:
-                title = "➕ Added to queue"
+                title = "Added to queue"
             await ctx.send(embed=track_embed(track, title=title, position=None if (was_idle or insert_first) else pos))
         else:
             added = player.extend_queue(tracks)
             await player.start()
-            e = embed(title="📥 Playlist queued", description=f"Added **{added}** tracks to the queue.")
+            e = embed(title="Playlist queued", description=f"Added **{added}** tracks to the queue.")
             if added < len(tracks):
                 e.description += f"\n-# Queue limit reached — {len(tracks) - added} track(s) were dropped."
             await ctx.send(embed=e)
@@ -237,7 +264,7 @@ class Music(commands.Cog):
             results = await self.bot.resolver.search(query, limit=config.SEARCH_RESULTS)
         except ExtractError as exc:
             raise UserError(f"Search failed. {friendly_stream_error(str(exc))}") from exc
-        e_note = ""
+        note = ""
         if not results:
             try:
                 results = await self.bot.resolver.sc_search_many(query, limit=config.SEARCH_RESULTS)
@@ -245,12 +272,12 @@ class Music(commands.Cog):
                 results = []
             if not results:
                 raise UserError(f"No results for `{sanitize(query, 60)}` — nothing on YouTube or SoundCloud.")
-            e_note = " · YouTube had nothing — showing **SoundCloud** results"
+            note = " · YouTube had nothing — showing SoundCloud results"
         e = embed(
-            title=f"🔎 Results for `{sanitize(query, 60)}`",
+            title=f"Results for `{sanitize(query, 60)}`",
             description="\n".join(f"`{i}.` {sanitize(t.title, 70)}" for i, t in enumerate(results, 1)),
         )
-        e.set_footer(text=f"Pick one from the menu below{e_note}")
+        e.set_footer(text=f"Pick one from the menu below{note}")
         await ctx.send(embed=e, view=SearchView(self, results, ctx.author))
 
     # ------------------------------------------------------------------ transport
@@ -261,7 +288,7 @@ class Music(commands.Cog):
         player = self._player(ctx)
         if not player.pause():
             raise UserError("Nothing is playing.")
-        await ctx.send(embed=ok_embed("⏸ Paused."))
+        await ctx.send(embed=ok_embed("Paused."))
 
     @commands.hybrid_command(name="resume", aliases=["r", "unpause"], description="Resume playback.")
     @commands.guild_only()
@@ -269,7 +296,7 @@ class Music(commands.Cog):
         player = self._player(ctx)
         if not player.resume():
             raise UserError("Nothing is paused.")
-        await ctx.send(embed=ok_embed("▶️ Resumed."))
+        await ctx.send(embed=ok_embed("Resumed."))
 
     @commands.hybrid_command(name="replay", aliases=["rp"], description="Restart the current track.")
     @commands.guild_only()
@@ -278,7 +305,7 @@ class Music(commands.Cog):
         if player.current is None:
             raise UserError("Nothing is playing.")
         await player.seek(0)
-        await ctx.send(embed=ok_embed("🔁 Replaying from the start."))
+        await ctx.send(embed=ok_embed("Replaying from the start."))
 
     @commands.hybrid_command(name="back", aliases=["b", "previous", "prev"], description="Play the previous track again.")
     @commands.guild_only()
@@ -287,19 +314,19 @@ class Music(commands.Cog):
         prev = await player.play_previous()
         if prev is None:
             raise UserError("No previous track in this session.")
-        await ctx.send(embed=track_embed(prev, title="⏮ Playing previous"))
+        await ctx.send(embed=track_embed(prev, title="Playing previous"))
 
     @commands.hybrid_command(name="panel", aliases=["controls"], description="Post a control panel with playback buttons.")
     @commands.guild_only()
     async def panel(self, ctx: commands.Context):
         player = self._player(ctx)
         e = embed(
-            title="🎛 Control panel",
+            title="Control panel",
             description=(
-                "Nothing is playing right now — `/play` something first.\n"
-                "**Prev · Play/Pause · Skip · Stop · Disconnect · Volume · Loop · Shuffle · Autoplay · Queue**"
-                if player.current is None
-                else "**Prev · Play/Pause · Skip · Stop · Disconnect · Volume · Loop · Shuffle · Autoplay · Queue**"
+                "Prev · Pause/Resume · Skip · Stop · Disconnect · Volume · Loop · Shuffle · Autoplay · Queue"
+                if player.current is not None
+                else "Nothing is playing right now — `/play` something first.\n"
+                "Buttons: Prev · Pause/Resume · Skip · Stop · Disconnect · Volume · Loop · Shuffle · Autoplay · Queue"
             ),
         )
         await ctx.send(embed=e, view=NowPlayingView(player))
@@ -312,7 +339,7 @@ class Music(commands.Cog):
         if prev is None:
             raise UserError("No previous track in this session.")
         pos = player.enqueue(prev, insert_first=True)
-        await ctx.send(embed=track_embed(prev, title="➕ Previous track queued", position=pos))
+        await ctx.send(embed=track_embed(prev, title="Previous track queued", position=pos))
 
     @commands.hybrid_command(name="skip", aliases=["s", "next"], description="Skip the current track (vote-skip when 3+ listeners).")
     @commands.guild_only()
@@ -322,28 +349,21 @@ class Music(commands.Cog):
         if result == "nothing":
             raise UserError("Nothing is playing.")
         if result == "vote":
-            await ctx.send(embed=ok_embed("🗳️ Skip vote started — check the message above."))
+            await ctx.send(embed=ok_embed("Skip vote started — check the message above."))
         else:
-            await ctx.send(embed=ok_embed("⏭ Skipping."))
+            await ctx.send(embed=ok_embed("Skipping."))
 
-    @commands.hybrid_command(name="skipto", aliases=["jump"], description="Jump to a track position in the queue.")
+    @commands.hybrid_command(name="jump", aliases=["skipto"], description="Jump to a track position in the queue.")
     @commands.guild_only()
     @app_commands.describe(position="Queue position to jump to (1 = next up)")
-    async def skipto(self, ctx: commands.Context, position: int):
+    async def jump(self, ctx: commands.Context, position: int):
         player = self._gate(ctx)
-        q = list(player.queue)
-        if not q:
-            raise UserError("The queue is empty.")
-        if not (1 <= position <= len(q)):
-            raise UserError(f"Position must be between 1 and {len(q)}.")
-        for _ in range(position - 1):
-            player.queue.popleft()
-        target = player.queue[0]
+        target = player.jump_to(position)
         if player.is_playing or player.is_paused:
             await player.skip()
         else:
             await player.start()
-        await ctx.send(embed=ok_embed(f"⏭ Jumping to **{sanitize(target.title)}**."))
+        await ctx.send(embed=ok_embed(f"Jumping to **{sanitize(target.title)}**."))
 
     # ------------------------------------------------------------------ info
 
@@ -360,8 +380,10 @@ class Music(commands.Cog):
             autoplay=player.autoplay,
             paused=player.is_paused,
         )
-        view = QueueView(player, max(1, min(page, pages)), pages) if pages > 1 else None
-        await ctx.send(embed=e, view=view)
+        if pages > 1:
+            await ctx.send(embed=e, view=QueueView(player, max(1, min(page, pages)), pages))
+        else:
+            await ctx.send(embed=e)
 
     @commands.hybrid_command(name="nowplaying", aliases=["np", "song"], description="Show what is playing right now.")
     @commands.guild_only()
@@ -379,7 +401,34 @@ class Music(commands.Cog):
             autoplay=player.autoplay,
             paused=player.is_paused,
         )
-        await ctx.send(embed=e, view=NowPlayingView(player))
+        await ctx.send(embed=e, view=NowPlayingView(player, compact=True))
+
+    @commands.hybrid_command(name="songinfo", aliases=["trackinfo"], description="Details about the current track.")
+    @commands.guild_only()
+    async def songinfo(self, ctx: commands.Context):
+        player = self._player(ctx)
+        t = player.current
+        if t is None:
+            raise UserError("Nothing is playing right now.")
+        url = t.webpage_url or ""
+        if t.direct_stream:
+            source = "Direct stream / radio"
+        elif "soundcloud" in url:
+            source = "SoundCloud"
+        elif t.video_id or "youtu" in url:
+            source = "YouTube"
+        else:
+            source = "Link"
+        e = embed(title="Song info")
+        e.description = f"**[{sanitize(t.title, 90)}]({url or 'https://discord.com'})**"
+        if t.uploader:
+            e.add_field(name="Artist / channel", value=sanitize(t.uploader, 60), inline=True)
+        e.add_field(name="Duration", value=f"`{fmt_duration(t.duration)}`", inline=True)
+        e.add_field(name="Source", value=source, inline=True)
+        e.add_field(name="Position", value=f"`{fmt_duration(player.position())}`", inline=True)
+        if t.requester_name:
+            e.add_field(name="Requested by", value=sanitize(t.requester_name, 40), inline=True)
+        await ctx.send(embed=e)
 
     @commands.hybrid_command(name="history", aliases=["hist"], description="Show recently played tracks.")
     @commands.guild_only()
@@ -390,8 +439,10 @@ class Music(commands.Cog):
         lines = []
         for i, entry in enumerate(entries, 1):
             who = f" — {sanitize(entry.get('requester_name') or '', 25)}" if entry.get("requester_name") else ""
-            lines.append(f"`{i:>2}.` [{sanitize(entry.get('title') or '?', 55)}]({entry.get('webpage_url') or 'https://discord.com'}){who}")
-        e = embed(title="📚 Recently played", description="\n".join(lines)[:4000])
+            lines.append(
+                f"`{i:>2}.` [{sanitize(entry.get('title') or '?', 55)}]({entry.get('webpage_url') or 'https://discord.com'}){who}"
+            )
+        e = embed(title="Recently played", description="\n".join(lines)[:4000])
         await ctx.send(embed=e)
 
     # ------------------------------------------------------------------ queue control
@@ -402,14 +453,14 @@ class Music(commands.Cog):
         player = self._gate(ctx)
         n = len(player.queue)
         player.queue.clear()
-        await ctx.send(embed=ok_embed(f"🧹 Cleared **{n}** track(s) from the queue."))
+        await ctx.send(embed=ok_embed(f"Cleared **{n}** track(s) from the queue."))
 
     @commands.hybrid_command(name="stop", description="Stop playback and clear the queue.")
     @commands.guild_only()
     async def stop(self, ctx: commands.Context):
         player = self._gate(ctx)
         await player.stop()
-        await ctx.send(embed=ok_embed("⏹ Stopped and cleared the queue."))
+        await ctx.send(embed=ok_embed("Stopped and cleared the queue."))
 
     @commands.hybrid_command(name="disconnect", aliases=["dc", "leave"], description="Stop and leave the voice channel.")
     @commands.guild_only()
@@ -419,14 +470,14 @@ class Music(commands.Cog):
             raise UserError("I'm not in a voice channel.")
         await player.disconnect()
         set_setting(ctx.guild.id, "stay247", False)
-        await ctx.send(embed=ok_embed("👋 Disconnected. (24/7 mode disabled)"))
+        await ctx.send(embed=ok_embed("Disconnected. (24/7 mode disabled)"))
 
     @commands.hybrid_command(name="join", aliases=["j", "connect"], description="Make me join your voice channel.")
     @commands.guild_only()
     async def join(self, ctx: commands.Context):
         player = self._player(ctx)
         channel = await self._ensure_player_voice(ctx, player)
-        await ctx.send(embed=ok_embed(f"🔊 Joined {channel.mention}."))
+        await ctx.send(embed=ok_embed(f"Joined {channel.mention}."))
 
     @commands.hybrid_command(name="moveme", aliases=["mm"], description="Move you to my voice channel.")
     @commands.guild_only()
@@ -455,7 +506,7 @@ class Music(commands.Cog):
     async def remove(self, ctx: commands.Context, position: int):
         player = self._gate(ctx)
         track = player.remove_track(position)
-        await ctx.send(embed=ok_embed(f"🗑️ Removed **{sanitize(track.title)}** from the queue."))
+        await ctx.send(embed=ok_embed(f"Removed **{sanitize(track.title)}** from the queue."))
 
     @commands.hybrid_command(name="shuffle", aliases=["sh"], description="Shuffle the queue.")
     @commands.guild_only()
@@ -466,7 +517,7 @@ class Music(commands.Cog):
         q = list(player.queue)
         random.shuffle(q)
         player.queue = deque(q)
-        await ctx.send(embed=ok_embed(f"🔀 Shuffled **{len(q)}** track(s)."))
+        await ctx.send(embed=ok_embed(f"Shuffled **{len(q)}** track(s)."))
 
     # ------------------------------------------------------------------ tuning
 
@@ -476,10 +527,12 @@ class Music(commands.Cog):
     async def volume(self, ctx: commands.Context, level: Optional[int] = None):
         player = self._gate(ctx)
         if level is None:
-            await ctx.send(embed=embed(title="🔊 Volume", description=f"Current volume: **{int(round(player.volume * 100))}%**"))
+            await ctx.send(
+                embed=embed(title="Volume", description=f"Current volume: **{int(round(player.volume * 100))}%**")
+            )
             return
         await player.set_volume(level)
-        await ctx.send(embed=ok_embed(f"🔊 Volume set to **{int(round(player.volume * 100))}%**."))
+        await ctx.send(embed=ok_embed(f"Volume set to **{int(round(player.volume * 100))}%**."))
 
     @commands.hybrid_command(name="loop", aliases=["l", "repeat"], description="Loop off / track / queue.")
     @commands.guild_only()
@@ -492,13 +545,15 @@ class Music(commands.Cog):
             "queue": "queue", "all": "queue",
         }
         if mode is None:
-            await ctx.send(embed=embed(title="🔁 Loop", description=f"Current mode: **{player.loop_mode}** — use `off`, `track` or `queue`."))
+            await ctx.send(
+                embed=embed(title="Loop", description=f"Current mode: **{player.loop_mode}** — use `off`, `track` or `queue`.")
+            )
             return
         key = mapping.get(mode.strip().lower())
         if key is None:
             raise UserError("Mode must be `off`, `track` or `queue`.")
         player.loop_mode = key
-        await ctx.send(embed=ok_embed(f"🔁 Loop mode set to **{key}**."))
+        await ctx.send(embed=ok_embed(f"Loop mode set to **{key}**."))
 
     @commands.hybrid_command(name="seek", description="Jump to a timestamp (e.g. 1:30, 90, +30, -30).")
     @commands.guild_only()
@@ -511,7 +566,7 @@ class Music(commands.Cog):
         if secs < 0:
             secs = max(0, int(player.position()) + secs)
         await player.seek(secs)
-        await ctx.send(embed=ok_embed(f"⏩ Seeking to `{fmt_duration(secs)}`."))
+        await ctx.send(embed=ok_embed(f"Seeking to `{fmt_duration(secs)}`."))
 
     @commands.hybrid_command(name="forward", aliases=["ff"], description="Fast-forward by N seconds (default 10).")
     @commands.guild_only()
@@ -519,7 +574,7 @@ class Music(commands.Cog):
     async def forward(self, ctx: commands.Context, seconds: int = 10):
         player = self._gate(ctx)
         await player.seek(int(player.position()) + max(1, seconds))
-        await ctx.send(embed=ok_embed(f"⏩ +{seconds}s"))
+        await ctx.send(embed=ok_embed(f"+{seconds}s"))
 
     @commands.hybrid_command(name="rewind", aliases=["rw"], description="Rewind by N seconds (default 10).")
     @commands.guild_only()
@@ -527,15 +582,15 @@ class Music(commands.Cog):
     async def rewind(self, ctx: commands.Context, seconds: int = 10):
         player = self._gate(ctx)
         await player.seek(max(0, int(player.position()) - max(1, seconds)))
-        await ctx.send(embed=ok_embed(f"⏪ -{seconds}s"))
+        await ctx.send(embed=ok_embed(f"-{seconds}s"))
 
-    @commands.hybrid_command(name="autoplay", aliases=["ap", "auto"], description="Toggle autoplay (queues related tracks when the queue ends).")
+    @commands.hybrid_command(name="autoplay", aliases=["ap", "auto"], description="Toggle autoplay (AI/related picks when the queue ends).")
     @commands.guild_only()
     @app_commands.describe(state="on/off (omit to toggle)")
     async def autoplay(self, ctx: commands.Context, state: Optional[bool] = None):
         player = self._gate(ctx)
         player.autoplay = (not player.autoplay) if state is None else bool(state)
-        await ctx.send(embed=ok_embed(f"✨ Autoplay **{'enabled' if player.autoplay else 'disabled'}**."))
+        await ctx.send(embed=ok_embed(f"Autoplay **{'enabled' if player.autoplay else 'disabled'}**."))
         if player.autoplay and player.current is None and not player.queue and player.history:
             try:
                 related = await self.bot.resolver.related(player.history[-1], 5, seen=player._autoplay_seen)
@@ -558,21 +613,22 @@ class Music(commands.Cog):
             if player.vc is None or not player.vc.is_connected():
                 channel = await self._require_voice(ctx)
                 await player.ensure_voice(channel)
-            await ctx.send(embed=ok_embed("♾️ **24/7 mode enabled** — I'll stay in the voice channel even when idle."))
+            await ctx.send(embed=ok_embed("**24/7 mode enabled** — I'll stay in the voice channel even when idle."))
         else:
             await ctx.send(embed=ok_embed("24/7 mode disabled — I'll leave once idle."))
 
-    @commands.hybrid_command(name="filter", aliases=["fl", "filters"], description="Audio filters (bassboost, nightcore, …).")
+    @commands.hybrid_command(name="filter", aliases=["fl", "filters"], description="Audio filters (bassboost, nightcore, vaporwave, …).")
     @commands.guild_only()
     @app_commands.describe(preset="Filter name (omit to list presets)")
+    @app_commands.autocomplete(preset=filter_autocomplete)
     async def filter_(self, ctx: commands.Context, preset: Optional[str] = None):
         player = self._gate(ctx)
         if preset is None:
             listed = ", ".join(f"`{k}`" for k in FILTERS)
-            await ctx.send(embed=embed(title="🎛 Filters", description=f"Current: **{player.filter}**\nAvailable: {listed}"))
+            await ctx.send(embed=embed(title="Filters", description=f"Current: **{player.filter}**\nAvailable: {listed}"))
             return
         await player.set_filter(preset)
-        await ctx.send(embed=ok_embed(f"🎛 Filter set to **{player.filter}**."))
+        await ctx.send(embed=ok_embed(f"Filter set to **{player.filter}**."))
 
     # ------------------------------------------------------------------ extras
 
@@ -590,14 +646,14 @@ class Music(commands.Cog):
         if not data or (not data.get("plain") and not data.get("instrumental")):
             raise UserError(f"No lyrics found for `{sanitize(query, 60)}`.")
         if data.get("instrumental"):
-            await ctx.send(embed=embed(title=f"🎼 {sanitize(data['title'], 60)}", description="Instrumental — no lyrics."))
+            await ctx.send(embed=embed(title=sanitize(data["title"], 60), description="Instrumental — no lyrics."))
             return
         text = data["plain"]
         if len(text) > 3900:
             text = text[:3899] + "…"
         await ctx.send(
             embed=embed(
-                title=f"📜 {sanitize(data['title'], 60)} — {sanitize(data['artist'], 40)}",
+                title=f"{sanitize(data['title'], 60)} — {sanitize(data['artist'], 40)}",
                 description=text,
             )
         )
@@ -610,7 +666,7 @@ class Music(commands.Cog):
             lines = [f"`{i:>2}.` {n}" for i, (n, _) in enumerate(RADIO_STATIONS, 1)]
             await ctx.send(
                 embed=embed(
-                    title="📻 Radio stations",
+                    title="Radio stations",
                     description="\n".join(lines) + "\n\nUse `/radios name:<text>` or paste any stream URL.",
                 )
             )
@@ -637,7 +693,7 @@ class Music(commands.Cog):
         )
         pos = player.enqueue(track)
         await player.start()
-        await ctx.send(embed=track_embed(track, title="📻 Tuning in", position=pos))
+        await ctx.send(embed=track_embed(track, title="Tuning in", position=pos))
 
     @commands.hybrid_command(name="clean", aliases=["purge"], description="Delete my recent messages in this channel.")
     @commands.guild_only()
@@ -648,13 +704,38 @@ class Music(commands.Cog):
             deleted = await ctx.channel.purge(limit=100, check=lambda m: m.author == self.bot.user)
         except discord.Forbidden as exc:
             raise UserError("I need **Manage Messages** to do that.") from exc
-        await ctx.send(embed=ok_embed(f"🧽 Deleted {len(deleted)} of my messages."))
+        await ctx.send(embed=ok_embed(f"Deleted {len(deleted)} of my messages."))
 
     @commands.hybrid_command(name="ping", aliases=["latency"], description="Check the bot's latency.")
     @commands.guild_only()
     async def ping(self, ctx: commands.Context):
         ws = int(round(self.bot.latency * 1000))
-        await ctx.send(embed=embed(title="🏓 Pong!", description=f"WebSocket latency: `{ws} ms`"))
+        await ctx.send(embed=embed(title="Pong!", description=f"WebSocket latency: `{ws} ms`"))
+
+    @commands.hybrid_command(name="stats", description="Bot statistics.")
+    @commands.guild_only()
+    async def stats(self, ctx: commands.Context):
+        started = getattr(self.bot, "_start_time", None)
+        uptime = fmt_duration(time.time() - started) if started else "?"
+        try:
+            import yt_dlp
+
+            ytdlp_v = yt_dlp.version.__version__
+        except Exception:  # noqa: BLE001
+            ytdlp_v = "?"
+        total_q = sum(len(p.queue) for p in self.bot.players.values())
+        e = embed(title="Statistics")
+        e.description = (
+            f"**Uptime:** {uptime}\n"
+            f"**Servers:** {len(self.bot.guilds)} · **active players:** {len(self.bot.players)}\n"
+            f"**Songs played (this run):** {getattr(self.bot, '_songs_played', 0)}\n"
+            f"**Tracks queued right now:** {total_q}\n"
+            f"**Latency:** {int(round(self.bot.latency * 1000))} ms · **yt-dlp:** {ytdlp_v}"
+        )
+        ai = getattr(self.bot, "ai", None)
+        if ai is not None and ai.available:
+            e.set_footer(text=f"AI: {ai.last_label or ' · '.join(ai.provider_labels())}")
+        await ctx.send(embed=e)
 
 
 async def setup(bot):

@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import discord
 from discord.ext import commands
 
 from . import config
+from .ai import AI
 from .player import GuildPlayer, UserError
 from .store import guild_prefix, guild_settings
 from .utils import error_embed
@@ -42,14 +44,40 @@ class DingBot(commands.Bot):
         )
         self.players: dict[int, GuildPlayer] = {}
         self.resolver = Resolver()
+        self.ai = AI()
         self._synced = False
+        self._start_time: float | None = None
+        self._songs_played = 0
 
     # ------------------------------------------------------------------ startup
 
     async def setup_hook(self):
-        for ext in ("bot.cogs.music", "bot.cogs.playlists", "bot.cogs.settings"):
+        self._start_time = time.time()
+        for ext in ("bot.cogs.music", "bot.cogs.playlists", "bot.cogs.settings", "bot.cogs.ai"):
             await self.load_extension(ext)
             log.info("loaded extension %s", ext)
+        self.tree.on_error = self._on_app_command_error
+
+    async def _on_app_command_error(self, interaction: discord.Interaction, error: Exception):
+        original: Exception = error
+        for _ in range(5):
+            nxt = getattr(original, "original", None)
+            if nxt is None:
+                break
+            original = nxt
+        if isinstance(original, UserError):
+            message = str(original)
+        else:
+            log.error("app command error: %r", error)
+            message = "Something went wrong — check the bot console for details."
+        e = error_embed(message)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=e, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=e, ephemeral=True)
+        except Exception:
+            pass
 
     async def on_ready(self):
         log.info("logged in as %s (%s) | %d guild(s)", self.user, self.user.id, len(self.guilds))
@@ -167,6 +195,10 @@ class DingBot(commands.Bot):
         try:
             await self.resolver.close()
         finally:
+            try:
+                await self.ai.close()
+            except Exception:
+                pass
             await super().close()
 
 

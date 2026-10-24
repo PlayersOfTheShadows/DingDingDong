@@ -198,12 +198,14 @@ class Settings(commands.Cog):
         s = guild_settings(ctx.guild.id)
         dj = f"<@&{s['dj_role']}>" if s.get("dj_role") else "*none*"
         ctrl = f"<#{s['controller_channel']}>" if s.get("controller_channel") else "*none*"
+        ai_chan = f"<#{s['ai_channel']}>" if s.get("ai_channel") else "*none*"
         e = embed(
-            title="⚙️ Server settings",
+            title="Server settings",
             description=(
                 f"**Prefix:** `{guild_prefix(ctx.guild.id)}`\n"
                 f"**DJ role:** {dj}\n"
                 f"**Request channel:** {ctrl}\n"
+                f"**AI channel:** {ai_chan}\n"
                 f"**24/7:** {'on' if s.get('stay247') else 'off'}\n"
                 f"**Auto-rejoin:** {'on' if s.get('autorejoin') else 'off'}\n"
                 f"**Announce now playing:** {'on' if s.get('announce', True) else 'off'}\n"
@@ -219,22 +221,24 @@ class Settings(commands.Cog):
     @commands.guild_only()
     async def help_cmd(self, ctx: commands.Context):
         e = embed(
-            title=f"🎵 {config.BOT_NAME} — commands",
+            title=f"{config.BOT_NAME} — commands",
             description=(
                 "**Playback**\n"
                 "`play` `playskip` `playtop` `playfile` `search` `pause` `resume` `replay` `back` `addprevious`\n"
-                "`skip` `skipto` `stop` `clear` `disconnect` `join` `moveme`\n\n"
+                "`skip` `jump` `stop` `clear` `disconnect` `join` `moveme`\n\n"
                 "**Queue & tuning**\n"
-                "`queue` `nowplaying` `history` `shuffle` `move` `remove` `volume` `loop` `seek` `forward` `rewind` `filter`\n\n"
+                "`queue` `nowplaying` `songinfo` `history` `shuffle` `move` `remove` `volume` `loop` `seek` `forward` `rewind` `filter`\n\n"
+                "**AI**\n"
+                "`ai` `ai channel` `ai ask` `ai model` `recommend` — or just talk in the AI channel\n\n"
                 "**Extras**\n"
-                "`autoplay` `24-7` `lyrics` `radios` `panel` `clean` `ping`\n\n"
+                "`autoplay` `24-7` `lyrics` `radios` `panel` `clean` `ping` `stats`\n\n"
                 "**Playlists**\n"
-                "`playlist create / add / addtrack / addqueue / show / play / delete / share / lock / list / public`\n\n"
+                "`playlist create / add / addtrack / addqueue / remove / rename / show / play / delete / share / lock / list / public`\n\n"
                 "**Server settings**\n"
                 "`prefix` `reset-prefix` `setdj` `controller` `songstatus` `announce` `autorejoin` `settings` `invite`"
             ),
         )
-        e.set_footer(text="Everything works as /slash and !prefix — try /play to start")
+        e.set_footer(text="Everything works as /slash and !prefix — /play shows live song suggestions")
         await ctx.send(embed=e)
 
     @commands.hybrid_command(name="invite", aliases=["link"], description="Get my invite link.")

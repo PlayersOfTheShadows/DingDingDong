@@ -80,6 +80,32 @@ Prefix short forms (like Luna/Flavi): `!p` `!ps` `!pt` `!q` `!np` `!s` `!r` `!vo
 - Autoplay queues related tracks from the track's YouTube mix when the queue ends.
 - Voice-channel status shows the current song (toggle: `/songstatus`).
 
+## AI (Groq + Google failover)
+
+Two providers are wired in; whichever answers first wins, and if the first one
+hits a quota error or outage the next takes over automatically (nothing to do
+by hand). Every AI reply says which model answered it.
+
+- `/ai channel [#channel]` — designate a channel where you can just **talk**:
+  *play darkside*, *skip this*, *set filter bassboost*, *volume 40*,
+  *jump to 3*, *what's queued?* — or plain chit-chat.
+- `/ai ask <question>` — one-off question from any channel.
+- `/ai model` — shows the configured models.
+- `/recommend [@user]` — AI suggestions built from that user's recent tracks
+  and playlists.
+- **Autoplay brain:** with `/autoplay` on, when the queue runs dry the AI looks
+  at the requester's last ~10 tracks + their playlists and queues the next
+  song itself (classic YouTube-mix autoplay remains as fallback).
+
+Configuration (`.env` locally, **environment variables on a hosting panel**):
+
+```env
+GROQ_API_KEY=
+GOOGLE_AI_API_KEY=
+AI_GROQ_MODEL=openai/gpt-oss-120b
+AI_GOOGLE_MODEL=gemini-3.8-flash
+```
+
 ## Reliability notes (why this one actually plays)
 
 - **davey** (Discord's E2EE voice requirement) is installed — without it `connect()` raises

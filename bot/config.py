@@ -51,7 +51,8 @@ PLAYLIST_URL_LIMIT = _int("PLAYLIST_URL_LIMIT", 100)
 SEARCH_RESULTS = _int("SEARCH_RESULTS", 8)
 
 # ---- idle behaviour ----
-IDLE_LEAVE_SECONDS = _int("IDLE_LEAVE_SECONDS", 600)
+# Generous default: stay in the voice channel for 2 hours even without 24/7.
+IDLE_LEAVE_SECONDS = _int("IDLE_LEAVE_SECONDS", 7200)
 EMPTY_CHANNEL_SECONDS = _int("EMPTY_CHANNEL_SECONDS", 180)
 
 # ---- YouTube extraction ----
@@ -64,6 +65,14 @@ YTDLP_COOKIES_FROM_BROWSER = (os.getenv("YTDLP_COOKIES_FROM_BROWSER") or "").str
 # file into the project folder (e.g. cookies.txt next to main.py) and set
 # YTDLP_COOKIE_FILE=cookies.txt (absolute paths work too). NEVER commit it.
 YTDLP_COOKIE_FILE = (os.getenv("YTDLP_COOKIE_FILE") or "").strip()
+
+# ---- AI (Groq primary, Google Gemini fallback) ----
+# Both providers are tried in order; whichever answers first wins. If the
+# first hits a quota/error the next takes over automatically.
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
+GOOGLE_AI_API_KEY = (os.getenv("GOOGLE_AI_API_KEY") or "").strip()
+AI_GROQ_MODEL = (os.getenv("AI_GROQ_MODEL") or "openai/gpt-oss-120b").strip()
+AI_GOOGLE_MODEL = (os.getenv("AI_GOOGLE_MODEL") or "gemini-3.8-flash").strip()
 
 # ---- paths ----
 DATA_DIR = BASE_DIR / "data"

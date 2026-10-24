@@ -66,10 +66,10 @@ class Playlists(commands.Cog):
     async def playlist(self, ctx: commands.Context):
         await ctx.send(
             embed=embed(
-                title="📃 Playlists",
+                title="Playlists",
                 description=(
-                    "`create <name>` · `delete <name>` · `list`\n"
-                    "`add <name> <song or URL>` · `addtrack <name>` · `addqueue <name>`\n"
+                    "`create <name>` (aka newplaylist) · `delete <name>` · `rename <name> <new>` · `list`\n"
+                    "`add <name> <song or URL>` · `addtrack <name>` · `addqueue <name>` · `remove <name> <pos>`\n"
                     "`show <name> [page]` · `play <name>`\n"
                     "`share <name>` · `lock <name>` · `public`"
                 ),
@@ -154,6 +154,42 @@ class Playlists(commands.Cog):
         added = self._append(pl, list(player.queue))
         save_playlists()
         await ctx.send(embed=ok_embed(f"Added **{added}** track(s) to **{sanitize(pl['name'], 60)}**."))
+
+    @playlist.command(name="remove", description="Remove a track from a playlist.")
+    @app_commands.describe(name="Playlist name", position="Track number in the playlist (see /playlist show)")
+    async def pl_remove(self, ctx: commands.Context, name: str, position: int):
+        pl = self._require(ctx, name)
+        tracks = pl["tracks"]
+        if not tracks:
+            raise UserError("That playlist is empty.")
+        if not (1 <= position <= len(tracks)):
+            raise UserError(f"Position must be between 1 and {len(tracks)}.")
+        removed = tracks.pop(position - 1)
+        save_playlists()
+        await ctx.send(
+            embed=ok_embed(
+                f"Removed **{sanitize(removed.get('title') or '?', 60)}** from "
+                f"**{sanitize(pl['name'], 60)}** ({len(tracks)} left)."
+            )
+        )
+
+    @playlist.command(name="rename", description="Rename a playlist.")
+    @app_commands.describe(name="Current name", new_name="New name")
+    async def pl_rename(self, ctx: commands.Context, name: str, *, new_name: str):
+        old_key = playlist_key(name)
+        new_key = playlist_key(new_name)
+        owned = user_playlists(ctx.author.id)
+        if old_key not in owned:
+            raise UserError(f"You don't have a playlist named `{sanitize(name, 40)}`.")
+        if not new_key:
+            raise UserError("The new name can't be empty.")
+        if new_key in owned and new_key != old_key:
+            raise UserError("You already have a playlist with that name.")
+        pl = owned.pop(old_key)
+        pl["name"] = new_name.strip()[:80]
+        owned[new_key] = pl
+        save_playlists()
+        await ctx.send(embed=ok_embed(f"Renamed to **{sanitize(pl['name'], 60)}**."))
 
     @playlist.command(name="show", description="Show the tracks in a playlist.")
     @app_commands.describe(name="Playlist name", page="Page number")

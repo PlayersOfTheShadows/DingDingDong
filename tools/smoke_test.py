@@ -16,7 +16,7 @@ import bot.main as m  # noqa: E402
 
 async def main() -> int:
     bot = m.DingBot()
-    extensions = ("bot.cogs.music", "bot.cogs.playlists", "bot.cogs.settings")
+    extensions = ("bot.cogs.music", "bot.cogs.playlists", "bot.cogs.settings", "bot.cogs.ai")
     for ext in extensions:
         await bot.load_extension(ext)
         print(f"loaded {ext}")

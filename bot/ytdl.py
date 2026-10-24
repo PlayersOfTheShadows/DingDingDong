@@ -154,6 +154,8 @@ class Resolver:
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
         self.working_client: Optional[str] = None
+        self._suggest_cache: dict[str, tuple[float, list[tuple[str, str]]]] = {}
+        self._suggest_tasks: dict[str, asyncio.Task] = {}
 
     # ---------------- lifecycle ----------------
 
@@ -486,6 +488,76 @@ class Resolver:
         candidates = await self._sc_candidates(query)
         candidates.sort(key=lambda t: self._sc_score(query, t), reverse=True)
         return candidates[:limit]
+
+    # ---------------- slash autocomplete ----------------
+
+    async def suggest(self, query: str, *, limit: int = 8) -> list[tuple[str, str]]:
+        """(label, value) pairs for /play autocomplete (Flavi-style live list).
+
+        Cached for 5 minutes; work keeps running in the background when Discord's
+        ~3 s reply budget would be exceeded, so the next keystroke is instant.
+        Never raises — the UI just shows no options on failure."""
+        q = re.sub(r"\s+", " ", (query or "").strip())
+        if len(q) < 2:
+            return []
+        now = time.time()
+        hit = self._suggest_cache.get(q.lower())
+        if hit is not None and now - hit[0] < 300:
+            return hit[1]
+        task = self._suggest_tasks.get(q.lower())
+        if task is None or task.done():
+            task = asyncio.ensure_future(self._suggest_build(q, limit))
+            self._suggest_tasks[q.lower()] = task
+            if len(self._suggest_tasks) > 80:
+                for key in [k for k, t in self._suggest_tasks.items() if t.done()][:40]:
+                    self._suggest_tasks.pop(key, None)
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=2.4)
+        except asyncio.TimeoutError:
+            return []
+        except Exception:  # noqa: BLE001
+            return []
+
+    async def _suggest_build(self, q: str, limit: int) -> list[tuple[str, str]]:
+        def _fmt(d) -> str:
+            try:
+                d = int(d)
+                return f"{d // 60}:{d % 60:02d}"
+            except (TypeError, ValueError):
+                return ""
+
+        out: list[tuple[str, str]] = []
+        entries: list[dict] = []
+        try:
+            info = await self._flat_search(f"ytsearch{max(limit, 6)}:{q}")
+            entries = [e for e in (info.get("entries") or []) if isinstance(e, dict)]
+        except Exception:  # noqa: BLE001
+            entries = []
+        for e in entries[:limit]:
+            title = (e.get("title") or "").strip()
+            url = (
+                e.get("webpage_url")
+                or e.get("url")
+                or (f"https://www.youtube.com/watch?v={e.get('id')}" if e.get("id") else "")
+            )
+            if not title or not url:
+                continue
+            dur = _fmt(e.get("duration"))
+            out.append((f"{title[:80]} · {dur}" if dur else title[:90], url))
+        if not out:  # YouTube empty/walled — SoundCloud rescue for the picker
+            try:
+                cands = await self._sc_candidates(q)
+            except Exception:  # noqa: BLE001
+                cands = []
+            for track in cands[:limit]:
+                dur = _fmt(track.duration)
+                label = f"{track.title[:80]} · {dur}" if dur else track.title[:90]
+                out.append((label, track.webpage_url or track.source_url))
+        self._suggest_cache[q.lower()] = (time.time(), out)
+        if len(self._suggest_cache) > 300:
+            for key in list(self._suggest_cache.keys())[:100]:
+                self._suggest_cache.pop(key, None)
+        return out
 
     async def sc_fallback(self, track: "Track") -> Optional["Track"]:
         """SoundCloud rescue for one specific track that YouTube refused."""

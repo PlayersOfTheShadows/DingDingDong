@@ -17,6 +17,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "announce": True,             # post "now playing" messages
     "songstatus": True,           # set voice-channel status to the current song
     "default_volume": 100,        # volume applied to new playback sessions
+    "ai_channel": None,           # channel id where the AI talks & controls music
 }
 
 
@@ -46,6 +47,9 @@ class JsonStore:
 
     def bucket(self, scope: Any) -> dict:
         return self._data.setdefault(str(scope), {})
+
+    def all(self) -> dict:
+        return self._data
 
     def get(self, scope: Any, key: str, default: Any = None) -> Any:
         return self._data.get(str(scope), {}).get(key, default)

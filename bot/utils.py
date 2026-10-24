@@ -82,10 +82,29 @@ def parse_timestamp(text: str) -> Optional[int]:
 
 # ------------------------------------------------------------------ embeds
 
+def _is_emojiish(ch: str) -> bool:
+    o = ord(ch)
+    return (
+        ch in "\ufe0f\u200d" or ch.isspace()
+        or 0x1F000 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF
+        or 0x2B00 <= o <= 0x2BFF or 0x2190 <= o <= 0x21FF or 0x1800 <= o <= 0x18AF
+    )
+
+
+def strip_leading_emoji(text: Optional[str]) -> Optional[str]:
+    """Drop decorative emoji/icons from the start of a line (professional look)."""
+    if not text:
+        return text
+    i = 0
+    while i < len(text) and _is_emojiish(text[i]) and not text[i].isalnum():
+        i += 1
+    return text[i:].lstrip() if i else text
+
+
 def embed(*, title=None, description=None, color=None, footer=True) -> discord.Embed:
     e = discord.Embed(
-        title=title,
-        description=description,
+        title=strip_leading_emoji(title),
+        description=strip_leading_emoji(description),
         color=color if color is not None else config.EMBED_COLOR,
     )
     if footer:
@@ -94,14 +113,14 @@ def embed(*, title=None, description=None, color=None, footer=True) -> discord.E
 
 
 def ok_embed(description: str, *, title=None) -> discord.Embed:
-    return embed(title=title, description=f"✅ {description}", color=config.EMBED_COLOR_OK)
+    return embed(title=title, description=description, color=config.EMBED_COLOR_OK)
 
 
 def error_embed(description: str, *, title=None) -> discord.Embed:
-    return embed(title=title, description=f"❌ {description}", color=config.EMBED_COLOR_ERROR)
+    return embed(title=title, description=description, color=config.EMBED_COLOR_ERROR)
 
 
-def track_embed(track, *, title="➕ Added to queue", position: Optional[int] = None) -> discord.Embed:
+def track_embed(track, *, title="Added to queue", position: Optional[int] = None) -> discord.Embed:
     e = embed(title=title)
     e.description = f"**[{sanitize(track.title, 90)}]({track.webpage_url})**"
     if track.duration:
@@ -126,20 +145,17 @@ def np_embed(
     autoplay: bool = False,
     paused: bool = False,
 ) -> discord.Embed:
-    e = embed(title="⏸ Paused" if paused else "▶️ Now playing")
+    e = embed(title="Paused" if paused else "Now playing")
     line = f"**[{sanitize(track.title, 90)}]({track.webpage_url})**"
     if track.uploader:
         line += f"\n`{sanitize(track.uploader, 60)}`"
-    if track.duration:
-        line += f"\n\n{progress_bar(position, track.duration)}\n`{fmt_duration(position)} / {fmt_duration(track.duration)}`"
-    else:
-        line += f"\n\n🔴 **LIVE** · `{fmt_duration(position)}` elapsed"
+    line += f"\n`{fmt_duration(track.duration) if track.duration else 'LIVE'}`"
     e.description = line
     if track.thumbnail:
         e.set_thumbnail(url=track.thumbnail)
-    meta = f"🔊 `{int(round(volume * 100))}%` · 🔁 `{loop_mode}` · 🎛 `{filter_name}` · 📜 `{queue_len}` queued"
+    meta = f"`{int(round(volume * 100))}%` · loop `{loop_mode}` · filter `{filter_name}` · `{queue_len}` queued"
     if autoplay:
-        meta += " · ✨ autoplay"
+        meta += " · autoplay on"
     e.add_field(name="Settings", value=meta, inline=False)
     if track.requester_name:
         e.add_field(name="Requested by", value=sanitize(track.requester_name, 40), inline=True)
@@ -159,10 +175,10 @@ def queue_embed(
     pages = max(1, math.ceil(len(tracks) / per_page))
     page = max(1, min(page, pages))
     start = (page - 1) * per_page
-    e = embed(title=f"📜 Queue — page {page}/{pages}")
+    e = embed(title=f"Queue — page {page}/{pages}")
     head = ""
     if current is not None:
-        head = f"**{'⏸' if paused else '▶️'} Now playing:** [{sanitize(current.title, 70)}]({current.webpage_url})\n\n"
+        head = f"**{'Paused' if paused else 'Now playing'}:** [{sanitize(current.title, 70)}]({current.webpage_url})\n\n"
     lines = []
     for i, t in enumerate(tracks[start : start + per_page], start=start + 1):
         entry = f"`{i:>2}.` [{sanitize(t.title, 55)}]({t.webpage_url}) · `{fmt_duration(t.duration)}`"

@@ -1,4 +1,10 @@
-"""Interactive views: now-playing controls, queue pagination, vote-skip."""
+"""Interactive views: now-playing controls, queue pagination, vote-skip.
+
+Note: our refresh helper is deliberately named `_refresh_panel` — discord.py's
+View base class owns a private synchronous `_refresh(components)`, and
+overriding that name with an async method breaks the library (components stop
+refreshing and asyncio warns about an un-awaited coroutine).
+"""
 from __future__ import annotations
 
 import logging
@@ -8,7 +14,7 @@ from typing import Optional
 import discord
 
 from .store import guild_settings, set_setting
-from .utils import embed, has_dj_bypass, is_dj, np_embed, queue_embed, sanitize
+from .utils import embed, has_dj_bypass, np_embed, queue_embed
 
 log = logging.getLogger("bot.views")
 
@@ -22,26 +28,33 @@ def _same_channel(interaction: discord.Interaction, player) -> bool:
 
 
 class NowPlayingView(discord.ui.View):
-    """Buttons under a now-playing message. Same rules as the equivalent commands."""
+    """Buttons under a now-playing message. Same rules as the equivalent commands.
 
-    def __init__(self, player):
+    compact=True keeps a single row of five core controls (used under /play);
+    the full 11-button layout is for /panel.
+    """
+
+    def __init__(self, player, *, compact: bool = False):
         super().__init__(timeout=600)
         self.player = player
         self.message: Optional[discord.Message] = None
+        if compact:
+            for item in (self.loop_btn, self.auto_btn, self.vol_down, self.vol_up, self.shuffle_btn, self.disconnect_btn):
+                self.remove_item(item)
         self._sync()
 
     # ---------------- helpers ----------------
 
     def _sync(self) -> None:
         p = self.player
-        self.toggle.emoji = "▶️" if p.is_paused else "⏸"
+        self.toggle.label = "Resume" if p.is_paused else "Pause"
         self.loop_btn.label = f"Loop: {p.loop_mode}"
         self.auto_btn.label = f"Autoplay: {'on' if p.autoplay else 'off'}"
 
     def _embed(self) -> discord.Embed:
         p = self.player
         if p.current is None:
-            return embed(title="⏹ Stopped", description="The queue is empty.")
+            return embed(title="Stopped", description="The queue is empty.")
         return np_embed(
             p.current,
             position=p.position(),
@@ -53,7 +66,7 @@ class NowPlayingView(discord.ui.View):
             paused=p.is_paused,
         )
 
-    async def _refresh(self, interaction: discord.Interaction) -> None:
+    async def _refresh_panel(self, interaction: discord.Interaction) -> None:
         self._sync()
         try:
             await interaction.response.edit_message(embed=self._embed(), view=self)
@@ -69,9 +82,9 @@ class NowPlayingView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-    # ---------------- buttons ----------------
+    # ---------------- core buttons (always visible) ----------------
 
-    @discord.ui.button(emoji="⏸", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Pause", style=discord.ButtonStyle.primary)
     async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not _same_channel(interaction, self.player):
             return await self._deny(interaction)
@@ -79,7 +92,7 @@ class NowPlayingView(discord.ui.View):
             self.player.resume()
         elif self.player.is_playing:
             self.player.pause()
-        await self._refresh(interaction)
+        await self._refresh_panel(interaction)
 
     @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary)
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -88,7 +101,7 @@ class NowPlayingView(discord.ui.View):
         result = await attempt_skip(self.player, interaction.user, channel=interaction.channel)
         if result == "vote":
             try:
-                await interaction.response.send_message("🗳️ Vote started — see the message above.", ephemeral=True)
+                await interaction.response.send_message("Vote started — see the message above.", ephemeral=True)
             except discord.HTTPException:
                 pass
         else:
@@ -104,7 +117,7 @@ class NowPlayingView(discord.ui.View):
         await self.player.stop()
         try:
             await interaction.response.edit_message(
-                embed=embed(title="⏹ Stopped", description="Playback stopped and the queue was cleared."),
+                embed=embed(title="Stopped", description="Playback stopped and the queue was cleared."),
                 view=None,
             )
         except discord.HTTPException:
@@ -117,18 +130,18 @@ class NowPlayingView(discord.ui.View):
         order = ["off", "track", "queue"]
         idx = order.index(self.player.loop_mode) if self.player.loop_mode in order else 0
         self.player.loop_mode = order[(idx + 1) % len(order)]
-        await self._refresh(interaction)
+        await self._refresh_panel(interaction)
 
     @discord.ui.button(label="Autoplay: off", style=discord.ButtonStyle.secondary)
     async def auto_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not _same_channel(interaction, self.player):
             return await self._deny(interaction)
         self.player.autoplay = not self.player.autoplay
-        await self._refresh(interaction)
+        await self._refresh_panel(interaction)
 
     # ---------------- extended panel controls ----------------
 
-    @discord.ui.button(label="⏮ Prev", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not _same_channel(interaction, self.player):
             return await self._deny(interaction)
@@ -144,19 +157,19 @@ class NowPlayingView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-    @discord.ui.button(label="Vol −10", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Vol -10", style=discord.ButtonStyle.secondary)
     async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not _same_channel(interaction, self.player):
             return await self._deny(interaction)
         await self.player.set_volume(int(round(self.player.volume * 100)) - 10)
-        await self._refresh(interaction)
+        await self._refresh_panel(interaction)
 
     @discord.ui.button(label="Vol +10", style=discord.ButtonStyle.secondary)
     async def vol_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not _same_channel(interaction, self.player):
             return await self._deny(interaction)
         await self.player.set_volume(int(round(self.player.volume * 100)) + 10)
-        await self._refresh(interaction)
+        await self._refresh_panel(interaction)
 
     @discord.ui.button(label="Shuffle", style=discord.ButtonStyle.secondary)
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -165,7 +178,7 @@ class NowPlayingView(discord.ui.View):
         n = self.player.shuffle_queue()
         try:
             await interaction.response.send_message(
-                f"🔀 Shuffled {n} track(s)." if n else "The queue is empty.", ephemeral=True
+                f"Shuffled {n} track(s)." if n else "The queue is empty.", ephemeral=True
             )
         except discord.HTTPException:
             pass
@@ -178,7 +191,7 @@ class NowPlayingView(discord.ui.View):
         set_setting(interaction.guild.id, "stay247", False)
         try:
             await interaction.response.edit_message(
-                embed=embed(title="👋 Disconnected", description="Left the voice channel."), view=None
+                embed=embed(title="Disconnected", description="Left the voice channel."), view=None
             )
         except discord.HTTPException:
             pass
@@ -194,9 +207,11 @@ class NowPlayingView(discord.ui.View):
             autoplay=player.autoplay,
             paused=player.is_paused,
         )
-        view = QueueView(player, 1, pages) if pages > 1 else None
+        kwargs: dict = {"embed": e, "ephemeral": True}
+        if pages > 1:
+            kwargs["view"] = QueueView(player, 1, pages)
         try:
-            await interaction.response.send_message(embed=e, view=view, ephemeral=True)
+            await interaction.response.send_message(**kwargs)
         except discord.HTTPException:
             pass
 
@@ -226,7 +241,7 @@ class QueueView(discord.ui.View):
         self._sync()
         return e
 
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
     async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = max(1, self.page - 1)
         try:
@@ -234,7 +249,7 @@ class QueueView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
     async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = min(self.pages, self.page + 1)
         try:
@@ -242,7 +257,7 @@ class QueueView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-    @discord.ui.button(label="✖", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger)
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await interaction.response.edit_message(view=None)
@@ -267,22 +282,22 @@ class VoteSkipView(discord.ui.View):
         self._sync()
 
     def _sync(self) -> None:
-        self.vote_btn.label = f"🗳️ Vote ({len(self.votes)}/{self.required})"
+        self.vote_btn.label = f"Vote ({len(self.votes)}/{self.required})"
 
     def build_embed(self, *, done: bool = False, cancelled: bool = False) -> discord.Embed:
         if done:
-            return embed(title="🗳️ Vote passed", description="Skipping to the next track.")
+            return embed(title="Vote passed", description="Skipping to the next track.")
         if cancelled:
-            return embed(title="🗳️ Vote cancelled")
+            return embed(title="Vote cancelled")
         return embed(
-            title="🗳️ Vote to skip",
+            title="Vote to skip",
             description=(
                 f"**{len(self.votes)}/{self.required}** votes needed.\n"
                 "Only members in the voice channel can vote. Expires in 2 minutes."
             ),
         )
 
-    @discord.ui.button(label="🗳️ Vote", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Vote", style=discord.ButtonStyle.success)
     async def vote_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in self.listener_ids:
             try:
@@ -332,7 +347,7 @@ class VoteSkipView(discord.ui.View):
         if self.message is not None:
             try:
                 await self.message.edit(
-                    embed=embed(title="🗳️ Vote expired", description="Not enough votes — the track keeps playing."),
+                    embed=embed(title="Vote expired", description="Not enough votes — the track keeps playing."),
                     view=None,
                 )
             except discord.HTTPException:
