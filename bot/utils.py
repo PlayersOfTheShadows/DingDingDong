@@ -200,3 +200,20 @@ def has_dj_bypass(member: discord.Member, settings: dict, vc) -> bool:
         if len(humans) <= 1:
             return True
     return False
+
+
+# ------------------------------------------------------------------ error text
+
+def friendly_stream_error(message: str) -> str:
+    """One short user-facing sentence for a raw yt-dlp/extractor error.
+
+    The raw text (wiki links, --cookies advice, extractor internals) stays in
+    the console log; Discord only ever sees friendly text."""
+    low = (message or "").lower()
+    if any(h in low for h in ("sign in to confirm", "not a bot", "http error 403", "forbidden", "blocked", "http 429")):
+        return "The streaming service is temporarily blocking this request — try again in a few minutes."
+    if any(h in low for h in ("no results", "no playable stream", "not found", "empty response")):
+        return "No playable source was found for that."
+    if any(h in low for h in ("private video", "video unavailable", "has been removed", "members-only", "does not exist")):
+        return "That video isn't available anymore (private, removed, or restricted)."
+    return "A temporary streaming error occurred — try again."

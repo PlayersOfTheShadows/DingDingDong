@@ -17,6 +17,7 @@ from ..store import get_history, guild_settings, set_setting
 from ..utils import (
     embed,
     fmt_duration,
+    friendly_stream_error,
     has_dj_bypass,
     np_embed,
     ok_embed,
@@ -189,7 +190,21 @@ class Music(commands.Cog):
         except UnsupportedPlatform as exc:
             raise UserError(str(exc)) from exc
         except ExtractError as exc:
-            raise UserError(f"Couldn't find anything for `{sanitize(query, 60)}` — {exc}") from exc
+            # YouTube search itself can be bot-walled (common on hosting IPs) —
+            # rescue the raw query through SoundCloud before giving up.
+            sc_track = None
+            try:
+                sc_track = await self.bot.resolver.sc_search(query, requester=ctx.author)
+            except Exception:  # noqa: BLE001
+                pass
+            if sc_track is None:
+                raise UserError(
+                    f"Couldn't find anything playable for `{sanitize(query, 60)}`. {friendly_stream_error(str(exc))}"
+                ) from exc
+            kind, tracks = "track", [sc_track]
+            await player._notice(
+                f"⚠️ YouTube returned nothing playable — using **{sanitize(sc_track.title)}** from SoundCloud instead."
+            )
         if kind == "track":
             track = tracks[0]
             pos = player.enqueue(track, insert_first=insert_first or then_skip)
@@ -221,14 +236,21 @@ class Music(commands.Cog):
         try:
             results = await self.bot.resolver.search(query, limit=config.SEARCH_RESULTS)
         except ExtractError as exc:
-            raise UserError(f"Search failed — {exc}") from exc
+            raise UserError(f"Search failed. {friendly_stream_error(str(exc))}") from exc
+        e_note = ""
         if not results:
-            raise UserError(f"No results for `{sanitize(query, 60)}`.")
+            try:
+                results = await self.bot.resolver.sc_search_many(query, limit=config.SEARCH_RESULTS)
+            except Exception:  # noqa: BLE001
+                results = []
+            if not results:
+                raise UserError(f"No results for `{sanitize(query, 60)}` — nothing on YouTube or SoundCloud.")
+            e_note = " · YouTube had nothing — showing **SoundCloud** results"
         e = embed(
             title=f"🔎 Results for `{sanitize(query, 60)}`",
             description="\n".join(f"`{i}.` {sanitize(t.title, 70)}" for i, t in enumerate(results, 1)),
         )
-        e.set_footer(text="Pick one from the menu below")
+        e.set_footer(text=f"Pick one from the menu below{e_note}")
         await ctx.send(embed=e, view=SearchView(self, results, ctx.author))
 
     # ------------------------------------------------------------------ transport

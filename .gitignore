@@ -6,3 +6,7 @@ __pycache__/
 data/
 bin/
 *.log
+
+# yt-dlp cookie exports — never commit (they ARE your account session)
+cookies.txt
+*.cookies.txt

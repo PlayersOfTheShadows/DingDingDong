@@ -119,6 +119,7 @@ Panel settings:
 - **Main file / start:** `main.py` (the root shim) — or in a console: `python -m bot.main`.
 - **Install:** `pip install -r requirements.txt` — includes `discord.py[voice]` → **davey**, which voice refuses to start without.
 - **Environment:** upload your local `.env` (file manager / SFTP) or set the same values as environment variables in the panel. `DISCORD_TOKEN` is the only strictly required one.
+- **YouTube on a datacenter IP:** hosts get bot-walled by YouTube far more than home machines. The bot already rescues via SoundCloud automatically, but for reliable YouTube playback upload a `cookies.txt` next to `main.py` (export it with any "Get cookies.txt" browser extension while logged into YouTube) and set `YTDLP_COOKIE_FILE=cookies.txt` in the panel Environment. Never commit the file — it is git-ignored.
 - **ffmpeg:** the repo ships no binaries; the bot uses system `ffmpeg` when `bin/` is absent, so a host with ffmpeg preinstalled just works. If voice connects but is silent, run `ffmpeg -version` in the panel console; if missing, upload a static Linux ffmpeg to `bin/ffmpeg` — it is picked up automatically.
 - Only one instance per token — stop the local copy before the hosted one comes online.
 

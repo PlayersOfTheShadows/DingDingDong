@@ -48,7 +48,7 @@ MAX_QUEUE = _int("MAX_QUEUE", 500)
 MAX_PLAYLIST_TRACKS = _int("MAX_PLAYLIST_TRACKS", 500)
 MAX_PLAYLISTS_PER_USER = _int("MAX_PLAYLISTS_PER_USER", 20)
 PLAYLIST_URL_LIMIT = _int("PLAYLIST_URL_LIMIT", 100)
-SEARCH_RESULTS = _int("SEARCH_RESULTS", 5)
+SEARCH_RESULTS = _int("SEARCH_RESULTS", 8)
 
 # ---- idle behaviour ----
 IDLE_LEAVE_SECONDS = _int("IDLE_LEAVE_SECONDS", 600)
@@ -59,6 +59,11 @@ EMPTY_CHANNEL_SECONDS = _int("EMPTY_CHANNEL_SECONDS", 180)
 # bot-walls). Or a browser name / "auto" (=firefox) to ALSO read that browser's
 # live YouTube session — no manual cookie export, nothing to refresh by hand.
 YTDLP_COOKIES_FROM_BROWSER = (os.getenv("YTDLP_COOKIES_FROM_BROWSER") or "").strip().lower()
+# Optional cookies.txt (Netscape format) for hosts with no browser to read
+# from — the reliable fix for YouTube bot-walls on datacenter IPs. Upload the
+# file into the project folder (e.g. cookies.txt next to main.py) and set
+# YTDLP_COOKIE_FILE=cookies.txt (absolute paths work too). NEVER commit it.
+YTDLP_COOKIE_FILE = (os.getenv("YTDLP_COOKIE_FILE") or "").strip()
 
 # ---- paths ----
 DATA_DIR = BASE_DIR / "data"

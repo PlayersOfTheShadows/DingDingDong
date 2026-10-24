@@ -14,7 +14,7 @@ import discord
 
 from . import config
 from .store import add_history, guild_settings
-from .utils import fmt_duration, np_embed, sanitize
+from .utils import fmt_duration, friendly_stream_error, np_embed, sanitize
 from .views import NowPlayingView
 from .ytdl import ExtractError, StreamError, Track
 
@@ -222,7 +222,8 @@ class GuildPlayer:
             try:
                 err = await self._play_track(track, seek=seek)
             except (StreamError, ExtractError, UserError) as exc:
-                await self._notice(f"⚠️ Couldn't play **{sanitize(track.title)}** — {exc}")
+                log.warning("playback failed in guild %s for %r: %s", self.guild.id, track.title, exc)
+                await self._notice(f"⚠️ Couldn't play **{sanitize(track.title)}** — {friendly_stream_error(str(exc))}")
                 continue
             except asyncio.CancelledError:
                 raise
@@ -381,7 +382,8 @@ class GuildPlayer:
     async def _handle_ffmpeg_error(self, track: Track, err: BaseException) -> bool:
         """One download-based retry per track. Returns True if handled."""
         if track.fallback_done or track.direct_stream:
-            await self._notice(f"⚠️ Playback of **{sanitize(track.title)}** failed — skipping. (`{err}`)")
+            log.warning("playback failed twice in guild %s for %r: %r", self.guild.id, track.title, err)
+            await self._notice(f"⚠️ Playback of **{sanitize(track.title)}** failed — skipping. {friendly_stream_error(str(err))}")
             return False
         track.fallback_done = True
         track.stream_url = None

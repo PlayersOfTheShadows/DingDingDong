@@ -16,7 +16,7 @@ from ..store import (
     save_playlists,
     user_playlists,
 )
-from ..utils import embed, fmt_duration, ok_embed, sanitize
+from ..utils import embed, fmt_duration, friendly_stream_error, ok_embed, sanitize
 from ..ytdl import ExtractError, Track, UnsupportedPlatform
 
 
@@ -126,7 +126,7 @@ class Playlists(commands.Cog):
         except UnsupportedPlatform as exc:
             raise UserError(str(exc)) from exc
         except ExtractError as exc:
-            raise UserError(f"Couldn't find `{sanitize(query, 60)}` — {exc}") from exc
+            raise UserError(f"Couldn't find `{sanitize(query, 60)}`. {friendly_stream_error(str(exc))}") from exc
         if kind == "track":
             tracks = tracks[:1]
         added = self._append(pl, tracks)

@@ -197,6 +197,15 @@ class Resolver:
         if cookies:
             browser = "firefox" if cookies == "auto" else cookies
             opts["cookiesfrombrowser"] = (browser,)
+        cookie_file = config.YTDLP_COOKIE_FILE
+        if cookie_file:
+            path = Path(cookie_file)
+            if not path.is_absolute():
+                path = config.BASE_DIR / path
+            if path.exists():
+                opts["cookiefile"] = str(path)
+            else:
+                log.warning("YTDLP_COOKIE_FILE is set but the file doesn't exist: %s", path)
         if flat is not None:
             opts["extract_flat"] = flat
         if client:
@@ -248,14 +257,20 @@ class Resolver:
         return any(hint in low for hint in PERMANENT_ERROR_HINTS)
 
     async def _flat_search(self, target: str) -> dict:
-        """Flat search with one client-retry: searches hit the same bot-checks
-        as playback."""
+        """Flat search with client retries: searches hit the same bot-checks as
+        playback (much more aggressive on datacenter/host IPs)."""
         try:
             return await self._extract(target, flat=True, playlist=True)
         except ExtractError as exc:
             if self._is_permanent_error(str(exc)):
                 raise
-            return await self._extract(target, client="android_vr", flat=True, playlist=True)
+            await asyncio.sleep(1.5)
+            for client in ("android_vr", "tv_embedded"):
+                try:
+                    return await self._extract(target, client=client, flat=True, playlist=True)
+                except ExtractError:
+                    continue
+            raise
 
     # ---------------- public API ----------------
 
@@ -390,35 +405,100 @@ class Resolver:
                 await asyncio.sleep(2.5)
         raise StreamError(f"no playable stream found ({last_err})")
 
+    async def _sc_candidates(self, query: str) -> list["Track"]:
+        """Raw SoundCloud candidates, trying progressively simpler query
+        variants until one returns results. Durations are normalized."""
+        base = re.sub(r"\s+", " ", (query or "").strip())
+        if not base:
+            return []
+        attempts = [base]
+        simple = re.sub(r"[^\w\s'-]", " ", base)
+        simple = re.sub(r"\s+", " ", simple).strip()
+        if simple and simple.lower() != base.lower():
+            attempts.append(simple)
+        short = " ".join(simple.split()[:3])
+        if short and short.lower() not in [a.lower() for a in attempts]:
+            attempts.append(short)
+        for attempt in attempts:
+            try:
+                info = await self._extract(f"scsearch10:{attempt}", flat=True, playlist=True)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("soundcloud search failed for %r: %r", attempt, exc)
+                continue
+            candidates = [Track.from_info(e) for e in info.get("entries") or [] if e.get("title")]
+            if not candidates:
+                continue
+            for cand in candidates:  # normalize odd ms durations defensively
+                if cand.duration and cand.duration > 20000:
+                    cand.duration = cand.duration // 1000
+            return candidates
+        return []
+
+    @staticmethod
+    def _sc_score(query: str, track: "Track") -> float:
+        """Relevance of a SoundCloud hit: fraction of meaningful query words in
+        the title, +1 when the whole query appears squashed together (guards
+        against SoundCloud's loose matching — 'Grown & Sexy' for 'sexy baka')."""
+        words = [w for w in re.sub(r"[^\w\s]", " ", (query or "").lower()).split() if len(w) > 1]
+        if not words:
+            return 0.0
+        title_low = (track.title or "").lower()
+        score = sum(1 for w in words if w in title_low) / len(words)
+        squashed_q = re.sub(r"[^a-z0-9]", "", (query or "").lower())
+        if squashed_q and squashed_q in re.sub(r"[^a-z0-9]", "", title_low):
+            score += 1.0
+        return score
+
+    async def sc_search(
+        self,
+        query: str,
+        *,
+        requester=None,
+        target_duration: Optional[int] = None,
+        requester_id: Optional[int] = None,
+        requester_name: str = "",
+    ) -> Optional["Track"]:
+        """Best SoundCloud match for a query — the cookie-free rescue path when
+        YouTube bot-walls or filters a search (common on hosts). Requires real
+        word overlap with the query; within the best-scoring group, prefers the
+        duration closest to target_duration."""
+        candidates = await self._sc_candidates(query)
+        if not candidates:
+            return None
+        ranked = sorted(candidates, key=lambda t: self._sc_score(query, t), reverse=True)
+        top_score = self._sc_score(query, ranked[0])
+        if top_score < 0.5:
+            return None
+        pool = [t for t in ranked if self._sc_score(query, t) >= top_score - 0.01]
+        if target_duration:
+            with_dur = [t for t in pool if t.duration]
+            best = min(with_dur, key=lambda t: abs(t.duration - target_duration)) if with_dur else pool[0]
+        else:
+            best = next((t for t in pool if t.duration and t.duration >= 60), pool[0])
+        best.requester_id = requester_id if requester_id is not None else getattr(requester, "id", None)
+        best.requester_name = requester_name or (
+            getattr(requester, "display_name", None) or getattr(requester, "name", "") or ""
+        )
+        return best
+
+    async def sc_search_many(self, query: str, limit: int = 8) -> list["Track"]:
+        """SoundCloud results list for /search fallback, best-relevance first."""
+        candidates = await self._sc_candidates(query)
+        candidates.sort(key=lambda t: self._sc_score(query, t), reverse=True)
+        return candidates[:limit]
+
     async def sc_fallback(self, track: "Track") -> Optional["Track"]:
-        """SoundCloud search for the same song — the cookie-free rescue path
-        when YouTube bot-walls every client. Picks the result whose duration
-        best matches the original (SoundCloud search loves 30s clips)."""
+        """SoundCloud rescue for one specific track that YouTube refused."""
         query = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", track.title or "")
         query = re.sub(r"\s+", " ", query).strip(" -–—|")
         if track.uploader and track.uploader.lower() not in query.lower():
             query = f"{query} {track.uploader}".strip()
-        if not query:
-            return None
-        try:
-            info = await self._extract(f"scsearch5:{query}", flat=True, playlist=True)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("soundcloud fallback search failed: %r", exc)
-            return None
-        candidates = [Track.from_info(e) for e in info.get("entries") or [] if e.get("title")]
-        if not candidates:
-            return None
-        for cand in candidates:  # normalize odd ms durations defensively
-            if cand.duration and cand.duration > 20000:
-                cand.duration = cand.duration // 1000
-        if track.duration:
-            with_dur = [t for t in candidates if t.duration]
-            best = min(with_dur, key=lambda t: abs(t.duration - track.duration)) if with_dur else candidates[0]
-        else:
-            best = next((t for t in candidates if t.duration and t.duration >= 60), candidates[0])
-        best.requester_id = track.requester_id
-        best.requester_name = track.requester_name
-        return best
+        return await self.sc_search(
+            query,
+            target_duration=track.duration,
+            requester_id=track.requester_id,
+            requester_name=track.requester_name,
+        )
 
     # ---------------- download fallback ----------------
 
