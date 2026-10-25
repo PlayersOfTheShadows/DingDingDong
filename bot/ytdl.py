@@ -212,6 +212,8 @@ class Resolver:
     def __init__(self) -> None:
         jsruntime.log_once()
         self._stream_cache: dict[str, tuple[float, str, dict]] = {}
+        #: set once a cookieless attempt wins after a cookie one returned nothing
+        self._cookies_stale = False
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ytdlp")
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
@@ -599,7 +601,7 @@ class Resolver:
         for pass_no in (1, 2):
             client_list = clients if pass_no == 1 else [c for c in RETRY_CLIENTS if c != self.working_client]
             for client in client_list:
-                if time.monotonic() > deadline:
+                if time.monotonic() >= deadline:
                     # this host is too slow for YouTube right now — hand over to
                     # the SoundCloud path rather than leaving the listener in silence
                     log.warning(
@@ -609,42 +611,44 @@ class Resolver:
                     raise StreamError("youtube is too slow from this host right now — using soundcloud")
                 label = client or "(default)"
                 info: Optional[dict] = None
-                try:
-                    info = await self._extract(target, client=client)
-                except Exception as exc:  # noqa: BLE001
-                    last_err = exc
-                    if self._looks_like_botwall(str(exc)):
-                        botwall_hits += 1
-                        if botwall_hits >= 2:
-                            self._trip_breaker(str(exc))
-                            raise StreamError("youtube bot-check — switching to soundcloud") from exc
-                    log.debug("pass %d: extract failed for client %s: %r", pass_no, label, exc)
-                url = (info or {}).get("url")
-
-                if not url and cookieless_tries < 4:
-                    # A logged-in session makes YouTube serve SABR-only streams
-                    # (storyboard, no audio) for some videos. One retry without
-                    # the cookies restores the normal format list; the cookies
-                    # stay in place for the bot-walled IPs everywhere else.
+                # Cookie-authenticated (web client) extraction is the right first
+                # choice on a bot-walled host — but a rotated cookie set makes it
+                # return no playable formats, and paying that dead attempt on every
+                # single play is what made playback crawl. Once we learn the set is
+                # stale, lead with the cookieless attempt instead.
+                modes = (False, None) if self._cookies_stale else (None, False)
+                for use_cookies in modes:
+                    if use_cookies is False:
+                        if cookieless_tries >= 4:
+                            break
+                        cookieless_tries += 1
                     try:
-                        info2 = await self._extract(target, client=client, use_cookies=False)
-                    except Exception as exc2:  # noqa: BLE001
-                        info2 = None
-                        if self._looks_like_botwall(str(exc2)):
+                        candidate = await self._extract(target, client=client, use_cookies=use_cookies)
+                    except Exception as exc:  # noqa: BLE001
+                        last_err = exc
+                        if self._looks_like_botwall(str(exc)):
                             botwall_hits += 1
                             if botwall_hits >= 2:
-                                self._trip_breaker(str(exc2))
-                                raise StreamError("youtube bot-check — switching to soundcloud") from exc2
-                        log.debug("pass %d: cookieless retry failed for %s: %r", pass_no, label, exc2)
-                    cookieless_tries += 1
-                    url = (info2 or {}).get("url")
-                    if url:
-                        info = info2
-                        log.info("client %s gave no playable formats with cookies — recovered without them", label)
-                        log.warning(
-                            "the saved cookies look rotated/stale (signed-in sessions get no playable "
-                            "formats) — re-export cookies.txt from the browser to restore YouTube"
+                                self._trip_breaker(str(exc))
+                                raise StreamError("youtube bot-check — switching to soundcloud") from exc
+                        log.debug(
+                            "pass %d: client %s (cookies=%s) failed: %r",
+                            pass_no, label, use_cookies is not False, exc,
                         )
+                        continue
+                    if (candidate or {}).get("url"):
+                        info = candidate
+                        if use_cookies is False and not self._cookies_stale:
+                            self._cookies_stale = True
+                            log.warning(
+                                "the saved cookies look rotated/stale (signed-in sessions get no "
+                                "playable formats) — re-export cookies.txt to restore YouTube; "
+                                "leading with the cookieless attempt meanwhile"
+                            )
+                        elif use_cookies is None and self._cookies_stale:
+                            self._cookies_stale = False  # cookies healthy again
+                        break
+                url = (info or {}).get("url")
 
                 if not url:
                     last_err = StreamError("no playable audio formats for this video")
