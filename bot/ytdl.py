@@ -414,7 +414,13 @@ class Resolver:
         if self.yt_blocked():
             raise ExtractError("youtube skipped (bot-check) — using soundcloud")
         try:
-            return await self._extract(target, flat=True, playlist=True)
+            return await asyncio.wait_for(
+                self._extract(target, flat=True, playlist=True),
+                timeout=config.YT_BUDGET_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            # a bound on searching too — the caller falls back to SoundCloud search
+            raise ExtractError("youtube search too slow from this host right now") from exc
         except ExtractError as exc:
             msg = str(exc)
             if self._is_permanent_error(msg):
@@ -553,7 +559,13 @@ class Resolver:
         """Forget a cached stream (call when playback proved it dead)."""
         self._stream_cache.pop(self._cache_key(track), None)
 
-    async def get_stream(self, track: "Track", *, refresh: bool = False) -> tuple[str, dict, dict]:
+    async def get_stream(
+        self,
+        track: "Track",
+        *,
+        refresh: bool = False,
+        budget: Optional[float] = None,
+    ) -> tuple[str, dict, dict]:
         """Resolve (stream_url, http_headers, fresh_info).
 
         Pass 1: every client in STREAM_CLIENTS (the last one that worked first).
@@ -578,6 +590,7 @@ class Resolver:
         if self.working_client is not None:
             clients.append(self.working_client)
         clients += [c for c in STREAM_CLIENTS if c != self.working_client]
+        deadline = time.monotonic() + (budget if budget is not None else config.YT_BUDGET_SECONDS)
         last_err: Optional[Exception] = None
         botwall_hits = 0
         noformat_hits = 0
@@ -586,6 +599,14 @@ class Resolver:
         for pass_no in (1, 2):
             client_list = clients if pass_no == 1 else [c for c in RETRY_CLIENTS if c != self.working_client]
             for client in client_list:
+                if time.monotonic() > deadline:
+                    # this host is too slow for YouTube right now — hand over to
+                    # the SoundCloud path rather than leaving the listener in silence
+                    log.warning(
+                        "youtube resolution exceeded the %.0fs budget — switching to soundcloud",
+                        budget if budget is not None else config.YT_BUDGET_SECONDS,
+                    )
+                    raise StreamError("youtube is too slow from this host right now — using soundcloud")
                 label = client or "(default)"
                 info: Optional[dict] = None
                 try:

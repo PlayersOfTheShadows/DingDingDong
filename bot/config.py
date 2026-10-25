@@ -78,6 +78,11 @@ if not YTDLP_COOKIE_FILE:
 # cookies.txt resets it instantly, and a restart clears it too.
 YOUTUBE_BREAK_SECONDS = _int("YOUTUBE_BREAK_SECONDS", 43200)
 
+#: Hard ceiling for one YouTube stream resolution. Shared/CPU-throttled hosts
+#: can take minutes where a home connection takes seconds; past this we give up
+#: and let the SoundCloud path serve the track quickly instead of stalling.
+YT_BUDGET_SECONDS = _int("YT_BUDGET_SECONDS", 30)
+
 # ---- AI (Groq primary, Google Gemini fallback) ----
 # Both providers are tried in order; whichever answers first wins. If the
 # first hits a quota/error the next takes over automatically.
