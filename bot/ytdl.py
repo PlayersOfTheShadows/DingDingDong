@@ -80,6 +80,29 @@ def _clean_error(text: str) -> str:
     return text or "unknown extraction error"
 
 
+class _QuietYDL:
+    """Route yt-dlp's own messages into our logger instead of letting
+    `ERROR: [youtube] …` lines land in the bot console. The bot reports what
+    matters itself (and switches platforms silently)."""
+
+    def debug(self, msg) -> None:
+        text = str(msg)
+        if not text.startswith("[debug]"):
+            log.debug("yt-dlp %s", text)
+
+    def info(self, msg) -> None:
+        log.debug("yt-dlp %s", msg)
+
+    def warning(self, msg) -> None:
+        log.debug("yt-dlp warning: %s", msg)
+
+    def error(self, msg) -> None:
+        log.debug("yt-dlp error: %s", msg)
+
+
+_QUIET_YDL = _QuietYDL()
+
+
 @dataclass
 class Track:
     title: str
@@ -268,6 +291,7 @@ class Resolver:
         flat: Any = None,
         playlist: bool = False,
         extra: Optional[dict] = None,
+        use_cookies: Optional[bool] = None,
     ) -> dict:
         opts: dict = {
             "quiet": True,
@@ -280,13 +304,18 @@ class Resolver:
             "socket_timeout": 20,
             "retries": 2,
             "cachedir": str(config.YTDLP_CACHE_DIR),
+            # keep yt-dlp's own chatter out of the console (see _QuietYDL)
+            "logger": _QUIET_YDL,
+            # a video whose formats we cannot use should not explode here — the
+            # caller detects the missing URL and retries / falls back instead
+            "ignore_no_formats_error": True,
         }
         cookies = config.YTDLP_COOKIES_FROM_BROWSER
-        if cookies:
+        if cookies and use_cookies is not False:
             browser = "firefox" if cookies == "auto" else cookies
             opts["cookiesfrombrowser"] = (browser,)
         cookie_file = config.YTDLP_COOKIE_FILE
-        if cookie_file:
+        if cookie_file and use_cookies is not False:
             path = Path(cookie_file)
             if not path.is_absolute():
                 path = config.BASE_DIR / path
@@ -310,8 +339,11 @@ class Resolver:
         flat: Any = None,
         playlist: bool = False,
         extra: Optional[dict] = None,
+        use_cookies: Optional[bool] = None,
     ) -> dict:
-        with yt_dlp.YoutubeDL(self._opts(client=client, flat=flat, playlist=playlist, extra=extra)) as ydl:
+        with yt_dlp.YoutubeDL(
+            self._opts(client=client, flat=flat, playlist=playlist, extra=extra, use_cookies=use_cookies)
+        ) as ydl:
             info = ydl.extract_info(target, download=False)
         if not isinstance(info, dict):
             raise ExtractError("Extractor returned no data.")
@@ -484,10 +516,14 @@ class Resolver:
         clients += [c for c in STREAM_CLIENTS if c != self.working_client]
         last_err: Optional[Exception] = None
         botwall_hits = 0
+        noformat_hits = 0
+        empty_hits = 0
+        cookieless_tries = 0
         for pass_no in (1, 2):
             client_list = clients if pass_no == 1 else [c for c in RETRY_CLIENTS if c != self.working_client]
             for client in client_list:
                 label = client or "(default)"
+                info: Optional[dict] = None
                 try:
                     info = await self._extract(target, client=client)
                 except Exception as exc:  # noqa: BLE001
@@ -498,12 +534,49 @@ class Resolver:
                             self._trip_breaker(str(exc))
                             raise StreamError("youtube bot-check — switching to soundcloud") from exc
                     log.debug("pass %d: extract failed for client %s: %r", pass_no, label, exc)
-                    continue
-                url = info.get("url")
+                url = (info or {}).get("url")
+
+                if not url and cookieless_tries < 4:
+                    # A logged-in session makes YouTube serve SABR-only streams
+                    # (storyboard, no audio) for some videos. One retry without
+                    # the cookies restores the normal format list; the cookies
+                    # stay in place for the bot-walled IPs everywhere else.
+                    try:
+                        info2 = await self._extract(target, client=client, use_cookies=False)
+                    except Exception as exc2:  # noqa: BLE001
+                        info2 = None
+                        if self._looks_like_botwall(str(exc2)):
+                            botwall_hits += 1
+                            if botwall_hits >= 2:
+                                self._trip_breaker(str(exc2))
+                                raise StreamError("youtube bot-check — switching to soundcloud") from exc2
+                        log.debug("pass %d: cookieless retry failed for %s: %r", pass_no, label, exc2)
+                    cookieless_tries += 1
+                    url = (info2 or {}).get("url")
+                    if url:
+                        info = info2
+                        log.info("client %s gave no playable formats with cookies — recovered without them", label)
+                        log.warning(
+                            "the saved cookies look rotated/stale (signed-in sessions get no playable "
+                            "formats) — re-export cookies.txt from the browser to restore YouTube"
+                        )
+
                 if not url:
-                    last_err = StreamError("extraction returned no direct audio URL")
+                    last_err = StreamError("no playable audio formats for this video")
+                    noformat_hits += 1
+                    if not (info or {}).get("formats"):
+                        # the video itself returned zero formats — no other client
+                        # will conjure any, so don't sweep nine of them for nothing
+                        empty_hits += 1
+                    log.debug(
+                        "pass %d: client %s returned no playable audio (noformat=%d empty=%d)",
+                        pass_no, label, noformat_hits, empty_hits,
+                    )
+                    if noformat_hits >= 3 or empty_hits >= 2:
+                        raise StreamError("youtube served no playable audio for this video — using soundcloud")
                     continue
-                headers = info.get("http_headers") or {}
+
+                headers = (info or {}).get("http_headers") or {}
                 ok, detail = await self.verify(url, headers)
                 if not ok:
                     last_err = StreamError(f"stream check failed: {detail}")
@@ -688,9 +761,10 @@ class Resolver:
 
     # ---------------- download fallback ----------------
 
-    def _download_sync(self, track: "Track") -> Path:
+    def _download_sync(self, track: "Track", *, use_cookies: Optional[bool] = None) -> Path:
         opts = self._opts(
             client=self.working_client,
+            use_cookies=use_cookies,
             extra={
                 "skip_download": False,
                 "outtmpl": str(config.CACHE_DIR / "dl_%(id)s.%(ext)s"),
@@ -720,6 +794,14 @@ class Resolver:
         except ExtractError:
             raise
         except yt_dlp.utils.DownloadError as exc:
+            # same SABR quirk as streaming — a cookieless retry often works
+            if self._is_youtube_target(track.source_url):
+                try:
+                    return await loop.run_in_executor(
+                        self._pool, functools.partial(self._download_sync, track, use_cookies=False)
+                    )
+                except Exception as exc2:  # noqa: BLE001
+                    log.debug("cookieless download retry failed: %r", exc2)
             raise StreamError(_clean_error(str(exc))) from exc
 
     # ---------------- autoplay ----------------
