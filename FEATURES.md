@@ -63,7 +63,7 @@ Legend: ✅ implemented · ➖ equivalent alternative · 🔜 planned (phase 3)
 | filters | ✅ | **17 presets** — added deep, chipmunk, earrape, dance, party, soft; autocomplete on `/filter` |
 | autoplay | ✅ | **AI picks the next song from the listener's last ~10 tracks + their playlists (Groq → Google failover); YouTube-mix fallback** |
 | AI chat channel | ✅ | `/ai channel` — talk naturally: play, skip, pause, filters, volume, jump, queue questions… |
-| AI Q&A | ✅ | `/ai ask` anywhere; every AI reply footers the model in use (`Groq AI · …` / `Google AI · …`) |
+| AI Q&A | ✅ | AI channel replies to every message (casual chat with memory + full music control); every AI reply footers the model in use (`Groq AI · …` / `Google AI · …`) |
 | AI recommendations | ✅ | `/recommend [@user]` — built from recent history + playlists |
 | 24/7 + autorejoin | ✅ | `/24-7`, `/autorejoin` |
 | lyrics | ✅ | lrclib.net (plain text; synced-live display 🔜) |

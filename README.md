@@ -89,7 +89,6 @@ by hand). Every AI reply says which model answered it.
 - `/ai channel [#channel]` — designate a channel where you can just **talk**:
   *play darkside*, *skip this*, *set filter bassboost*, *volume 40*,
   *jump to 3*, *what's queued?* — or plain chit-chat.
-- `/ai ask <question>` — one-off question from any channel.
 - `/ai model` — shows the configured models.
 - `/recommend [@user]` — AI suggestions built from that user's recent tracks
   and playlists.
