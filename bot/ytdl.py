@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import re
 import time
@@ -30,6 +31,19 @@ STREAM_CLIENTS: list[str] = ["", "android_vr", "tv_embedded", "android", "tv", "
 RETRY_CLIENTS: list[str] = ["", "android_vr", "tv_embedded"]
 # Errors that mean "stop retrying": the video itself is gone/restricted.
 PERMANENT_ERROR_HINTS = ("video unavailable", "private video", "has been removed", "members-only", "does not exist")
+# Errors meaning "this IP is bot-walled". Retrying other player clients barely
+# helps and each sweep costs 30-60 s, so the first confirmation opens a circuit
+# breaker: YouTube is checked ONCE, then SoundCloud serves the rest of the day.
+BOTWALL_HINTS = (
+    "sign in to confirm",
+    "not a bot",
+    "use --cookies",
+    "cookies for the authentication",
+    "this helps protect our community",
+    "too many requests",
+    "http error 429",
+)
+BREAK_FILE_NAME = "yt_breaker.json"
 
 UNSUPPORTED_DOMAINS = {
     "open.spotify.com": "Spotify",
@@ -154,6 +168,7 @@ class Resolver:
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
         self.working_client: Optional[str] = None
+        self._yt_break_until: float = self._load_breaker()
         self._suggest_cache: dict[str, tuple[float, list[tuple[str, str]]]] = {}
         self._suggest_tasks: dict[str, asyncio.Task] = {}
 
@@ -172,6 +187,77 @@ class Resolver:
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._pool.shutdown(wait=False)
+
+    # ---------------- youtube circuit breaker ----------------
+
+    def _breaker_path(self) -> Path:
+        return config.DATA_DIR / BREAK_FILE_NAME
+
+    def _load_breaker(self) -> float:
+        """Restore a previous trip, unless fresh cookies landed after it."""
+        path = self._breaker_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            until = float(data.get("until") or 0)
+            tripped = float(data.get("tripped") or 0)
+        except Exception:  # noqa: BLE001
+            return 0.0
+        if until <= time.time():
+            return 0.0
+        cookie_file = config.YTDLP_COOKIE_FILE
+        if cookie_file and tripped:
+            cp = Path(cookie_file)
+            if not cp.is_absolute():
+                cp = config.BASE_DIR / cp
+            try:
+                if cp.exists() and cp.stat().st_mtime > tripped:
+                    log.info("youtube cookies were refreshed — resetting the circuit breaker")
+                    self._clear_breaker()
+                    return 0.0
+            except OSError:
+                pass
+        log.info("youtube circuit open for another %.0f min — soundcloud only", (until - time.time()) / 60)
+        return until
+
+    def _clear_breaker(self) -> None:
+        self._yt_break_until = 0.0
+        try:
+            self._breaker_path().unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _trip_breaker(self, reason: str) -> None:
+        window = max(60, config.YOUTUBE_BREAK_SECONDS)
+        now = time.time()
+        self._yt_break_until = now + window
+        try:
+            self._breaker_path().write_text(
+                json.dumps({"tripped": now, "until": self._yt_break_until, "reason": str(reason)[:200]}),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        log.warning(
+            "youtube bot-walled this host — youtube skipped for %.1f h (soundcloud only): %s",
+            window / 3600, str(reason)[:140],
+        )
+
+    def yt_blocked(self) -> bool:
+        """True while YouTube should be skipped entirely."""
+        if self._yt_break_until and time.time() >= self._yt_break_until:
+            self._clear_breaker()
+            return False
+        return bool(self._yt_break_until)
+
+    @staticmethod
+    def _looks_like_botwall(message: str) -> bool:
+        low = (message or "").lower()
+        return any(hint in low for hint in BOTWALL_HINTS)
+
+    @staticmethod
+    def _is_youtube_target(target: str) -> bool:
+        low = (target or "").lower()
+        return "youtube.com" in low or "youtu.be" in low
 
     # ---------------- sync core ----------------
 
@@ -259,13 +345,26 @@ class Resolver:
         return any(hint in low for hint in PERMANENT_ERROR_HINTS)
 
     async def _flat_search(self, target: str) -> dict:
-        """Flat search with client retries: searches hit the same bot-checks as
-        playback (much more aggressive on datacenter/host IPs)."""
+        """Flat search: searches hit the same bot-checks as playback (much more
+        aggressive on datacenter/host IPs). A confirmed bot-wall trips the
+        circuit breaker right away, so YouTube is checked ONCE and SoundCloud
+        handles the rest of the day instead of every play re-timing-out."""
+        if self.yt_blocked():
+            raise ExtractError("youtube skipped (bot-check) — using soundcloud")
         try:
             return await self._extract(target, flat=True, playlist=True)
         except ExtractError as exc:
-            if self._is_permanent_error(str(exc)):
+            msg = str(exc)
+            if self._is_permanent_error(msg):
                 raise
+            if self._looks_like_botwall(msg):
+                await asyncio.sleep(0.8)
+                try:
+                    return await self._extract(target, client="android_vr", flat=True, playlist=True)
+                except ExtractError as exc2:
+                    if self._looks_like_botwall(str(exc2)):
+                        self._trip_breaker(str(exc2))
+                    raise
             await asyncio.sleep(1.5)
             for client in ("android_vr", "tv_embedded"):
                 try:
@@ -295,6 +394,8 @@ class Resolver:
         return False
 
     async def search(self, query: str, limit: int = 5) -> list["Track"]:
+        if self.yt_blocked():
+            return await self.sc_search_many(query, limit=limit)
         info = await self._flat_search(f"ytsearch{limit}:{query}")
         out = []
         for entry in info.get("entries", []):
@@ -324,6 +425,8 @@ class Resolver:
 
     async def _resolve_url(self, url: str, *, requester, playlist_limit: int) -> tuple[str, list["Track"]]:
         low = url.lower()
+        if self._is_youtube_target(low) and self.yt_blocked():
+            raise ExtractError("youtube skipped (bot-check) — try the song name instead")
         for domain, platform in UNSUPPORTED_DOMAINS.items():
             if domain in low:
                 raise UnsupportedPlatform(
@@ -371,11 +474,16 @@ class Resolver:
         target = track.source_url
         if not target:
             raise StreamError("Track has no source URL.")
+        if self._is_youtube_target(target) and self.yt_blocked():
+            # breaker open — let the player's SoundCloud rescue handle it
+            # instead of running the 30-60 s client sweep all over again
+            raise StreamError("youtube skipped (bot-check) — using soundcloud")
         clients: list[str] = []
         if self.working_client is not None:
             clients.append(self.working_client)
         clients += [c for c in STREAM_CLIENTS if c != self.working_client]
         last_err: Optional[Exception] = None
+        botwall_hits = 0
         for pass_no in (1, 2):
             client_list = clients if pass_no == 1 else [c for c in RETRY_CLIENTS if c != self.working_client]
             for client in client_list:
@@ -384,6 +492,11 @@ class Resolver:
                     info = await self._extract(target, client=client)
                 except Exception as exc:  # noqa: BLE001
                     last_err = exc
+                    if self._looks_like_botwall(str(exc)):
+                        botwall_hits += 1
+                        if botwall_hits >= 2:
+                            self._trip_breaker(str(exc))
+                            raise StreamError("youtube bot-check — switching to soundcloud") from exc
                     log.debug("pass %d: extract failed for client %s: %r", pass_no, label, exc)
                     continue
                 url = info.get("url")
@@ -528,11 +641,12 @@ class Resolver:
 
         out: list[tuple[str, str]] = []
         entries: list[dict] = []
-        try:
-            info = await self._flat_search(f"ytsearch{max(limit, 6)}:{q}")
-            entries = [e for e in (info.get("entries") or []) if isinstance(e, dict)]
-        except Exception:  # noqa: BLE001
-            entries = []
+        if not self.yt_blocked():
+            try:
+                info = await self._flat_search(f"ytsearch{max(limit, 6)}:{q}")
+                entries = [e for e in (info.get("entries") or []) if isinstance(e, dict)]
+            except Exception:  # noqa: BLE001
+                entries = []
         for e in entries[:limit]:
             title = (e.get("title") or "").strip()
             url = (
@@ -598,6 +712,8 @@ class Resolver:
         return path
 
     async def download(self, track: "Track") -> Path:
+        if self._is_youtube_target(track.source_url) and self.yt_blocked():
+            raise StreamError("youtube skipped (bot-check)")
         loop = asyncio.get_running_loop()
         try:
             return await loop.run_in_executor(self._pool, functools.partial(self._download_sync, track))
@@ -610,6 +726,8 @@ class Resolver:
 
     async def related(self, track: "Track", limit: int = 5, *, seen: Optional[set] = None) -> list["Track"]:
         """YouTube mix seeded by the given track, minus already-played videos."""
+        if self.yt_blocked():
+            return []
         seen = seen or set()
         vid = track.video_id
         if not vid:

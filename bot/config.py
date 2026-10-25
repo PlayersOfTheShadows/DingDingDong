@@ -72,6 +72,12 @@ if not YTDLP_COOKIE_FILE:
     if _auto_cookies.exists():
         YTDLP_COOKIE_FILE = str(_auto_cookies)
 
+# When YouTube bot-walls the host IP (it does, on datacenter ranges), don't
+# re-check on every play — once confirmed, skip YouTube for this window and go
+# straight to SoundCloud (no visible platform plumbing). Uploading a fresh
+# cookies.txt resets it instantly, and a restart clears it too.
+YOUTUBE_BREAK_SECONDS = _int("YOUTUBE_BREAK_SECONDS", 43200)
+
 # ---- AI (Groq primary, Google Gemini fallback) ----
 # Both providers are tried in order; whichever answers first wins. If the
 # first hits a quota/error the next takes over automatically.

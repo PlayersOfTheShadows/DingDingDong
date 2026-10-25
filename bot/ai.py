@@ -1,8 +1,11 @@
 """Multi-provider AI helper — Groq (OpenAI-compatible) with Google Gemini fallback.
 
-Both providers are tried in order; whichever answers first wins. If the first
-runs into a quota/server problem the next one takes over. Keys come from .env
-(GROQ_API_KEY / GOOGLE_AI_API_KEY). No extra dependencies — plain aiohttp.
+Both providers are tried in order; whichever answers first wins. Provider
+problems are retried once and then failed over: capacity spikes, socket
+timeouts, and reasoning models that burn the whole token budget and return
+empty text (the big one for Groq's gpt-oss models) all get a second attempt
+with a bigger budget instead of silently failing.
+Keys come from .env (GROQ_API_KEY / GOOGLE_AI_API_KEY). Plain aiohttp.
 """
 from __future__ import annotations
 
@@ -58,11 +61,27 @@ CHAT_SYSTEM = (
 )
 
 
+def _describe(exc: BaseException) -> str:
+    """One-line, never-empty description of an exception (bare TimeoutError has no text)."""
+    name = type(exc).__name__
+    text = str(exc).strip()
+    if not text:
+        return f"{name} (no message)"
+    return text if name.lower() in text.lower() else f"{name}: {text}"
+
+
 class AIError(Exception):
     """No provider could answer."""
 
 
 class AI:
+    # substrings / type names that are worth one immediate retry
+    TRANSIENT_HINTS = (
+        "http 5", "timeout", "timed out", "connector", "serverdisconnected",
+        "clientconnection", "connection reset", "read error", "temporarily",
+        "service unavailable", "overloaded", "rate limit", "http 429",
+    )
+
     def __init__(self) -> None:
         self.groq_key = config.GROQ_API_KEY
         self.google_key = config.GOOGLE_AI_API_KEY
@@ -88,7 +107,7 @@ class AI:
     async def _sess(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=40),
+                timeout=aiohttp.ClientTimeout(total=60),
                 headers={"User-Agent": _UA},
             )
         return self._session
@@ -96,6 +115,19 @@ class AI:
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
             await self._session.close()
+
+    @classmethod
+    def _is_transient(cls, exc: BaseException) -> bool:
+        """Capacity spikes, socket hiccups, timeouts — retry those once."""
+        if isinstance(exc, asyncio.TimeoutError):
+            return True
+        name = type(exc).__name__.lower()
+        if any(h in name for h in ("timeout", "connector", "disconnected", "reset")):
+            return True
+        low = str(exc).lower()
+        if not low.strip():
+            return True  # bare exceptions (e.g. TimeoutError) carry no message
+        return any(h in low for h in cls.TRANSIENT_HINTS)
 
     # ------------------------------------------------------------------ providers
 
@@ -113,11 +145,16 @@ class AI:
             "https://api.groq.com/openai/v1/chat/completions",
             json=payload,
             headers={"Authorization": f"Bearer {self.groq_key}"},
+            timeout=aiohttp.ClientTimeout(total=50),
         ) as resp:
             data = await resp.json(content_type=None)
             if resp.status != 200:
                 raise AIError(f"groq http {resp.status}: {str(data)[:180]}")
-            return data["choices"][0]["message"]["content"]
+            choice = (data.get("choices") or [{}])[0]
+            text = (choice.get("message") or {}).get("content") or ""
+            if not text.strip() and choice.get("finish_reason") == "length":
+                log.warning("groq hit the token cap before producing text (max_tokens=%s)", max_tokens)
+            return text
 
     async def _google(self, system: str, messages: list[dict], max_tokens: int, json_mode: bool) -> str:
         contents = []
@@ -134,14 +171,20 @@ class AI:
         }
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.google_model}:generateContent"
         sess = await self._sess()
-        async with sess.post(url, json=payload, headers={"x-goog-api-key": self.google_key}) as resp:
+        async with sess.post(
+            url,
+            json=payload,
+            headers={"x-goog-api-key": self.google_key},
+            timeout=aiohttp.ClientTimeout(total=80),
+        ) as resp:
             data = await resp.json(content_type=None)
             if resp.status != 200:
                 raise AIError(f"google http {resp.status}: {str(data)[:180]}")
             try:
                 return data["candidates"][0]["content"]["parts"][0]["text"]
             except (KeyError, IndexError) as exc:
-                raise AIError(f"google returned no text: {str(data)[:180]}") from exc
+                detail = str(data.get("promptFeedback") or data)[:180]
+                raise AIError(f"google returned no text: {detail}") from exc
 
     def _providers(self):
         if self.groq_key:
@@ -150,6 +193,44 @@ class AI:
             yield "google", self._google
 
     # ------------------------------------------------------------------ core calls
+
+    async def _provider_text(
+        self, name: str, fn, system: str, messages: list[dict], max_tokens: int, json_mode: bool
+    ) -> str:
+        """One provider, with the recovery ladder:
+        json-mode hiccup → plain text · transient error → retry ·
+        empty text (reasoning ate the budget) → retry with a bigger budget."""
+
+        async def _call(tokens: int, jm: bool) -> str:
+            return await fn(system, messages, tokens, jm)
+
+        try:
+            text = await _call(max_tokens, json_mode)
+        except AIError as exc:
+            low = str(exc).lower()
+            if json_mode and "json_validate" in low:
+                log.warning("provider %s json mode failed — retrying as plain text", name)
+                text = await _call(max_tokens, False)
+            elif self._is_transient(exc):
+                log.warning("provider %s transient failure (%s) — retrying once", name, _describe(exc))
+                await asyncio.sleep(1.5)
+                text = await _call(max_tokens, json_mode)
+            else:
+                raise
+        except Exception as exc:  # noqa: BLE001 — timeouts / socket noise are not AIError
+            if self._is_transient(exc):
+                log.warning("provider %s transient failure (%s) — retrying once", name, _describe(exc))
+                await asyncio.sleep(1.5)
+                text = await _call(max_tokens, json_mode)
+            else:
+                raise
+        if not (text or "").strip():
+            bigger = min(max(max_tokens * 2, 900), 2400)
+            log.warning("provider %s returned empty text — retrying with max_tokens=%d", name, bigger)
+            text = await _call(bigger, False)
+        if not (text or "").strip():
+            raise AIError(f"{name} returned an empty response twice")
+        return text
 
     async def chat(
         self,
@@ -161,37 +242,19 @@ class AI:
     ) -> tuple[str, str]:
         """Returns (text, provider_label). Tries each configured provider in order."""
         messages = [{"role": "user", "content": message}]
-        last: Optional[Exception] = None
+        last: Optional[BaseException] = None
         for name, fn in self._providers():
             try:
-                try:
-                    text = await fn(system, messages, max_tokens, json_mode)
-                except AIError as exc:
-                    low = str(exc).lower()
-                    if json_mode and "json_validate" in low:
-                        # Malformed JSON under strict response_format — retry as
-                        # plain text; _loose_json still extracts the object.
-                        log.warning("provider %s json mode failed — retrying as plain text", name)
-                        text = await fn(system, messages, max_tokens, False)
-                    elif any(t in low for t in ("http 5", "timeout", "timed out", "connector", "serverdisconnected", "clientconnection")):
-                        # Transient failure (capacity spike, socket hiccup) — retry once.
-                        log.warning("provider %s transient failure (%s) — retrying once", name, str(exc)[:80])
-                        await asyncio.sleep(1.5)
-                        text = await fn(system, messages, max_tokens, json_mode)
-                    else:
-                        raise
-                if not (text or "").strip():
-                    # Some models can answer with empty text (e.g. token budget
-                    # eaten by reasoning) — treat it as a failure and fall through.
-                    raise AIError(f"{name} returned an empty response")
-                model = self.groq_model if name == "groq" else self.google_model
-                label = f"{'Groq AI' if name == 'groq' else 'Google AI'} · {model}"
-                self.last_label = label
-                return text, label
+                text = await self._provider_text(name, fn, system, messages, max_tokens, json_mode)
             except Exception as exc:  # noqa: BLE001
                 last = exc
-                log.warning("ai provider %s failed: %s", name, exc)
-        raise AIError(str(last) if last else "no AI providers configured")
+                log.warning("ai provider %s failed: %s", name, _describe(exc))
+                continue
+            model = self.groq_model if name == "groq" else self.google_model
+            label = f"{'Groq AI' if name == 'groq' else 'Google AI'} · {model}"
+            self.last_label = label
+            return text, label
+        raise AIError(_describe(last) if last else "no AI providers configured")
 
     @staticmethod
     def _loose_json(text: str) -> dict:
@@ -214,10 +277,12 @@ class AI:
         if history:
             msg += f"\nRecent conversation (oldest → newest):\n{history}\n"
         msg += f"\nUser message: {text}"
+        # Generous budget: reasoning models (groq gpt-oss) can otherwise spend
+        # every token thinking and return an empty string.
         raw, _ = await self.chat(
             system=MUSIC_SYSTEM,
             message=msg,
-            max_tokens=350,
+            max_tokens=900,
             json_mode=True,
         )
         try:
@@ -243,7 +308,7 @@ class AI:
             f"Playlist picks: {', '.join(x for x in playlists if x)[:1200] or '(none)'}\n"
             "Pick the next song."
         )
-        raw, _ = await self.chat(system=system, message=msg, max_tokens=300, json_mode=True)
+        raw, _ = await self.chat(system=system, message=msg, max_tokens=500, json_mode=True)
         try:
             data = self._loose_json(raw)
         except AIError:
@@ -265,7 +330,7 @@ class AI:
             f"Recent: {', '.join(x for x in recent if x)[:1200] or '(none)'}\n"
             f"From their playlists: {', '.join(x for x in playlist if x)[:1200] or '(none)'}"
         )
-        raw, label = await self.chat(system=system, message=msg, max_tokens=400, json_mode=True)
+        raw, label = await self.chat(system=system, message=msg, max_tokens=700, json_mode=True)
         try:
             data = self._loose_json(raw)
         except AIError:

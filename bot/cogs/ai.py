@@ -275,12 +275,24 @@ class AICog(commands.Cog):
         hist = self._history_block(message.channel.id)
         async with message.channel.typing():
             action = None
+            providers_down = False
             try:
                 action = await ai.interpret_music(content, state=self._state(message.guild), history=hist)
+            except AIError:
+                # every provider failed — skip the plain-chat fallback (another
+                # full round of retries) and answer straight away
+                providers_down = True
+                log.warning("ai providers down while interpreting", exc_info=True)
             except Exception:  # noqa: BLE001
                 log.warning("ai interpret failed", exc_info=True)
             label = ai.last_label
             if not action:
+                if providers_down:
+                    await message.reply(
+                        "my ai providers aren't answering right now — try me again in a minute.",
+                        mention_author=False,
+                    )
+                    return
                 try:
                     text, label = await ai.chat(
                         system=CHAT_SYSTEM.format(bot=config.BOT_NAME),
