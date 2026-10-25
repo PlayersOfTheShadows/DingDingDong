@@ -18,7 +18,7 @@ from typing import Any, Optional
 import aiohttp
 import yt_dlp
 
-from . import config
+from . import config, jsruntime
 
 log = logging.getLogger("bot.ytdl")
 
@@ -130,6 +130,15 @@ class Track:
             or (info.get("url") if direct else None)
             or ""
         )
+        if not webpage and isinstance(info.get("url"), str) and info["url"].startswith(("http://", "https://")):
+            # flat entries (ytsearch/scsearch) carry the real watch URL in `url`
+            # with no webpage_url — without this every search result was built
+            # with an empty link
+            webpage = info["url"]
+        if not webpage:
+            vid = str(info.get("id") or "")
+            if re.fullmatch(r"[A-Za-z0-9_-]{11}", vid) and str(info.get("ie_key") or "").startswith("Youtube"):
+                webpage = f"https://www.youtube.com/watch?v={vid}"
         thumb = info.get("thumbnail")
         if not thumb:
             thumbs = info.get("thumbnails") or []
@@ -183,10 +192,26 @@ class Track:
         return ""
 
 
+def _js_runtime_opts() -> dict:
+    """{"js_runtimes": {runtime: {config}}} when a JS runtime is available."""
+    runtime = jsruntime.detect()
+    if not runtime:
+        return {}
+    name, path = runtime
+    return {"js_runtimes": {name: ({"path": path} if path else {})}}
+
+
 class Resolver:
     """Runs yt-dlp (synchronous) inside a small thread pool."""
 
+    #: how long a resolved stream URL may be reused (YouTube URLs live ~6h;
+    #: 30 min is comfortably inside that and kills the 12s cost on replays,
+    #: loop mode, and anything the prefetcher already warmed)
+    STREAM_CACHE_TTL = 1800.0
+
     def __init__(self) -> None:
+        jsruntime.log_once()
+        self._stream_cache: dict[str, tuple[float, str, dict]] = {}
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ytdlp")
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
@@ -306,6 +331,11 @@ class Resolver:
             "cachedir": str(config.YTDLP_CACHE_DIR),
             # keep yt-dlp's own chatter out of the console (see _QuietYDL)
             "logger": _QUIET_YDL,
+            # YouTube's signature / n challenges run in a JS runtime (deno) with
+            # the yt-dlp-ejs solver. Without them a cookie-authenticated (web
+            # client) extraction loses most formats and every play dies with
+            # "Requested format is not available".
+            **_js_runtime_opts(),
             # a video whose formats we cannot use should not explode here — the
             # caller detects the missing URL and retries / falls back instead
             "ignore_no_formats_error": True,
@@ -494,7 +524,36 @@ class Resolver:
         except Exception as exc:  # noqa: BLE001
             return False, f"{type(exc).__name__}: {exc}"
 
-    async def get_stream(self, track: "Track") -> tuple[str, dict, dict]:
+    def _cache_key(self, track: "Track") -> str:
+        return (track.video_id or track.source_url or track.webpage_url or "").strip()
+
+    def _cache_get(self, track: "Track") -> Optional[tuple[str, dict]]:
+        key = self._cache_key(track)
+        if not key:
+            return None
+        hit = self._stream_cache.get(key)
+        if not hit:
+            return None
+        stamp, url, headers = hit
+        if (time.monotonic() - stamp) > self.STREAM_CACHE_TTL:
+            self._stream_cache.pop(key, None)
+            return None
+        return url, headers
+
+    def _cache_put(self, track: "Track", url: str, headers: dict) -> None:
+        key = self._cache_key(track)
+        if not key:
+            return
+        self._stream_cache[key] = (time.monotonic(), url, dict(headers or {}))
+        if len(self._stream_cache) > 300:  # prune the oldest third
+            for old in sorted(self._stream_cache, key=lambda k: self._stream_cache[k][0])[:100]:
+                self._stream_cache.pop(old, None)
+
+    def drop_cached(self, track: "Track") -> None:
+        """Forget a cached stream (call when playback proved it dead)."""
+        self._stream_cache.pop(self._cache_key(track), None)
+
+    async def get_stream(self, track: "Track", *, refresh: bool = False) -> tuple[str, dict, dict]:
         """Resolve (stream_url, http_headers, fresh_info).
 
         Pass 1: every client in STREAM_CLIENTS (the last one that worked first).
@@ -503,6 +562,11 @@ class Resolver:
         after a short pause before giving up."""
         if track.direct_stream:
             return track.webpage_url, track.http_headers or {}, {}
+        if not refresh:
+            hit = self._cache_get(track)
+            if hit is not None:
+                log.debug("stream cache hit for %r", track.title)
+                return hit[0], hit[1], {}
         target = track.source_url
         if not target:
             raise StreamError("Track has no source URL.")
@@ -585,6 +649,7 @@ class Resolver:
                 if self.working_client != client:
                     self.working_client = client
                     log.info("using youtube player client: %s", label)
+                self._cache_put(track, url, headers)
                 return url, headers, info
             if pass_no == 1:
                 if self._is_permanent_error(str(last_err)):

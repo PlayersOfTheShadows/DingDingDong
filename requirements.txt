@@ -2,3 +2,5 @@ discord.py[voice]>=2.7.1
 yt-dlp>=2026.10.21
 python-dotenv>=1.2.4
 aiohttp>=3.14.0
+yt-dlp-ejs>=0.8.0
+deno>=2.9.8

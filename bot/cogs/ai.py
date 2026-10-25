@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import deque
 from typing import Optional
 
@@ -14,7 +15,7 @@ from .. import config
 from ..ai import CHAT_SYSTEM, AIError
 from ..player import UserError
 from ..store import get_history, guild_prefix, guild_settings, set_setting, user_playlists
-from ..utils import embed, sanitize
+from ..utils import embed, parse_timestamp, sanitize
 
 log = logging.getLogger("bot.ai.cog")
 
@@ -76,6 +77,87 @@ class AICog(commands.Cog):
         e = embed(description=text[:1900] or "…")
         e.set_footer(text=f"Using {label}" if label else config.BOT_NAME)
         return e
+
+    # ------------------------------------------------------------------ instant commands
+
+    def _current_volume(self, guild: discord.Guild) -> float:
+        try:
+            return float(self.bot.get_player(guild).volume)
+        except Exception:  # noqa: BLE001
+            return 1.0
+
+    def _quick_action(self, text: str, guild: discord.Guild) -> Optional[dict]:
+        """Deterministically parse the commands people actually type.
+
+        "skip", "pause", "volume 40", "loop queue", "play <song>" are answered in
+        microseconds without an AI round-trip: music control must never depend on
+        a model being up, and must never lag. Patterns are anchored full matches,
+        so ordinary chat ("why did you skip that") still goes to the model.
+        """
+        raw = (text or "").strip()
+        t = re.sub(r"\s+", " ", raw.lower()).strip("!.?,;: ")
+        if not t or len(t) > 200:
+            return None
+
+        def full(pattern: str) -> bool:
+            return re.fullmatch(pattern, t) is not None
+
+        # volume / loudness, using the player's live level
+        m = re.fullmatch(r"(?:set )?(?:volume|vol)\s*(?:to|=|at)?\s*(\d{1,3})\s*%?", t)
+        if m:
+            return {"action": "volume", "level": int(m.group(1))}
+        if full(r"(?:louder|turn it up|volume up|a bit louder)"):
+            return {"action": "volume", "level": int(self._current_volume(guild) * 100) + 15}
+        if full(r"(?:quieter|turn it down|volume down|softer)"):
+            return {"action": "volume", "level": int(self._current_volume(guild) * 100) - 15}
+
+        # seek / forward / rewind
+        m = re.fullmatch(r"(?:seek|jump|go)(?: to)?\s+(\d{1,2}:\d{2}(?::\d{2})?|\d{1,4})\s*(?:s|sec|secs|seconds)?", t)
+        if m:
+            secs = parse_timestamp(m.group(1))
+            if secs is not None:
+                return {"action": "seek", "seconds": secs}
+        m = re.fullmatch(r"(?:forward|ff)\s*(?:by\s*)?(\d{1,3})?\s*(?:s|sec|secs|seconds)?", t)
+        if m:
+            return {"action": "forward", "seconds": int(m.group(1) or 15)}
+        m = re.fullmatch(r"(?:rewind|back)\s*(?:by\s*)?(\d{1,3})?\s*(?:s|sec|secs|seconds)?", t)
+        if m and t not in ("back", "back one"):
+            return {"action": "rewind", "seconds": int(m.group(1) or 15)}
+
+        # loop (queue/off before the bare form)
+        if full(r"(?:loop|repeat)\s+(?:queue|all)"):
+            return {"action": "loop", "mode": "queue"}
+        if full(r"(?:unloop|loop off|stop looping|no loop|repeat off|loop none|loop nothing)"):
+            return {"action": "loop", "mode": "off"}
+        if full(r"(?:loop|repeat)(?:\s+(?:this|the))?(?:\s+(?:song|track|one|current))?"):
+            return {"action": "loop", "mode": "track"}
+
+        for pattern, action in (
+            (r"(?:skip|next)(?:\s+(?:this|song|track|one))?", "skip"),
+            (r"(?:pause|hold on|hold up)", "pause"),
+            (r"(?:resume|continue|unpause|carry on)", "resume"),
+            (r"(?:replay|again|restart|play it again)(?:\s+(?:this|the)\s+(?:song|track))?", "replay"),
+            (r"(?:previous|prev|go back|back one|last (?:song|track))", "previous"),
+            (r"(?:now playing|what(?:'s| is) playing|np|current song)", "nowplaying"),
+            (r"(?:queue|what(?:'s| is) (?:in the )?queue|show (?:the )?queue)", "queue"),
+            (r"(?:shuffle|mix it up|randomi[sz]e)", "shuffle"),
+            (r"(?:stop|stop playing|stop the music|shut up|silence)", "stop"),
+            (r"(?:leave|disconnect|leave vc|get out of here)", "disconnect"),
+        ):
+            if full(pattern):
+                return {"action": action}
+
+        m = re.fullmatch(r"(?i)(?:play|put on|queue up)\s+(.+)", raw)
+        if m and len(m.group(1)) <= 200:
+            return {"action": "play", "query": m.group(1).strip()}
+
+        m = re.fullmatch(r"autoplay\s+(on|off)", t)
+        if m:
+            return {"action": "autoplay", "state": m.group(1) == "on"}
+        m = re.fullmatch(r"(?:filter|effect)\s+(.+)", t)
+        if m:
+            return {"action": "filter", "name": m.group(1).strip()}
+        return None
 
     # ------------------------------------------------------------------ action executor
 
@@ -272,6 +354,20 @@ class AICog(commands.Cog):
                 except discord.HTTPException:
                     pass
             return
+        quick = self._quick_action(content, message.guild)
+        if quick is not None:
+            # instant path — no model, no lag
+            try:
+                note = await self._execute(message.guild, quick, message.author, message.channel)
+            except UserError as exc:
+                note = str(exc)
+            except Exception:  # noqa: BLE001
+                log.exception("quick action failed")
+                note = "Something went wrong running that — try again."
+            self._remember(message.channel.id, content, note)
+            await message.reply(embed=self._reply_embed(note, None), mention_author=False)
+            return
+
         hist = self._history_block(message.channel.id)
         async with message.channel.typing():
             action = None

@@ -61,6 +61,7 @@ class GuildPlayer:
         self._volume: float = 1.0
         self._runner: Optional[asyncio.Task] = None
         self._idle_watchdog: Optional[asyncio.Task] = None
+        self._prefetch_task: Optional[asyncio.Task] = None
 
         self._done = asyncio.Event()
         self._after_error: Optional[BaseException] = None
@@ -268,6 +269,36 @@ class GuildPlayer:
             elif self.loop_mode == "queue":
                 self.queue.append(track)
 
+    def _schedule_prefetch(self) -> None:
+        """Warm the next queued track's stream while the current one plays.
+
+        A cold YouTube resolve costs ~12s; resolving during playback means the
+        gap between songs is ~0 instead of dead air. Best-effort and silent.
+        """
+        task = self._prefetch_task
+        if task is not None and not task.done():
+            return
+        if not self.queue:
+            return
+        nxt = self.queue[0]
+        if nxt is None or nxt.direct_stream or nxt.stream_url:
+            return
+        if not (nxt.video_id or nxt.source_url or nxt.webpage_url):
+            return
+        try:
+            self._prefetch_task = self.bot.loop.create_task(self._prefetch_stream(nxt))
+        except RuntimeError:
+            self._prefetch_task = None
+
+    async def _prefetch_stream(self, track: Track) -> None:
+        try:
+            await self.bot.resolver.get_stream(track)
+            log.info("prefetched %r — next track starts instantly", track.title)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.debug("prefetch for %r failed (harmless): %r", track.title, exc)
+
     async def _next_track(self) -> Optional[Track]:
         if not self.queue and self.autoplay and self.current is not None:
             self.queue.extend(await self._autoplay_fill())
@@ -423,6 +454,7 @@ class GuildPlayer:
         except Exception as exc:  # noqa: BLE001
             return exc
         await self._announce_track(track)
+        self._schedule_prefetch()
         await self._done.wait()
         return self._after_error
 
@@ -452,6 +484,10 @@ class GuildPlayer:
             return False
         track.fallback_done = True
         track.stream_url = None
+        try:
+            self.bot.resolver.drop_cached(track)
+        except Exception:  # noqa: BLE001
+            log.debug("cache drop failed", exc_info=True)
         log.info("stream died for %r — retrying via download (silent)", track.title)
         try:
             path = await self.bot.resolver.download(track)
