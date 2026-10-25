@@ -229,9 +229,7 @@ class Music(commands.Cog):
                     f"Couldn't find anything playable for `{sanitize(query, 60)}`. {friendly_stream_error(str(exc))}"
                 ) from exc
             kind, tracks = "track", [sc_track]
-            await player._notice(
-                f"YouTube returned nothing playable — using **{sanitize(sc_track.title)}** from SoundCloud instead."
-            )
+            log.info("youtube search failed — silently using soundcloud match %r", sc_track.title)
         if kind == "track":
             track = tracks[0]
             pos = player.enqueue(track, insert_first=insert_first or then_skip)
@@ -401,7 +399,7 @@ class Music(commands.Cog):
             autoplay=player.autoplay,
             paused=player.is_paused,
         )
-        await ctx.send(embed=e, view=NowPlayingView(player, compact=True))
+        await ctx.send(embed=e, view=NowPlayingView(player))
 
     @commands.hybrid_command(name="songinfo", aliases=["trackinfo"], description="Details about the current track.")
     @commands.guild_only()

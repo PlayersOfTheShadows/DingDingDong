@@ -393,8 +393,12 @@ class GuildPlayer:
                     log.debug("soundcloud fallback lookup failed", exc_info=True)
                 if fallback is None:
                     raise
-                await self._notice(
-                    f"YouTube is blocking **{sanitize(track.title)}** — playing **{sanitize(fallback.title)}** from SoundCloud instead."
+                # Silently switch to the SoundCloud match — users shouldn't see
+                # platform plumbing, only music.
+                log.info(
+                    "youtube blocked %r — silently switched to soundcloud match %r",
+                    track.title,
+                    fallback.title,
                 )
                 track = fallback
                 url, headers, fresh = await self.bot.resolver.get_stream(track)
@@ -448,18 +452,18 @@ class GuildPlayer:
             return False
         track.fallback_done = True
         track.stream_url = None
-        await self._notice(f"Stream died for **{sanitize(track.title)}** — retrying via download…")
+        log.info("stream died for %r — retrying via download (silent)", track.title)
         try:
             path = await self.bot.resolver.download(track)
         except Exception as exc:  # noqa: BLE001
             log.warning("download fallback failed: %r", exc)
-            await self._notice(f"Download fallback failed — skipping **{sanitize(track.title)}**.")
+            await self._notice(f"Couldn't play **{sanitize(track.title)}** — skipping.")
             return False
         try:
             err2 = await self._play_local(track, path)
             if err2 is None:
                 return True
-            await self._notice(f"Playback failed again — skipping **{sanitize(track.title)}**.")
+            await self._notice(f"Couldn't play **{sanitize(track.title)}** — skipping.")
             return False
         finally:
             try:
@@ -611,19 +615,35 @@ class GuildPlayer:
         self.bot._songs_played = getattr(self.bot, "_songs_played", 0) + 1
         settings = guild_settings(self.guild.id)
         if settings.get("announce", True) and self._notice_channel is not None:
-            try:
-                e = np_embed(
-                    track,
-                    position=0.0,
-                    loop_mode=self.loop_mode,
-                    volume=self._volume,
-                    filter_name=self.filter,
-                    queue_len=len(self.queue),
-                    autoplay=self.autoplay,
-                )
-                self._np_message = await self._notice_channel.send(embed=e, view=NowPlayingView(self, compact=True))
-            except Exception:
-                self._np_message = None
+            e = np_embed(
+                track,
+                position=0.0,
+                loop_mode=self.loop_mode,
+                volume=self._volume,
+                filter_name=self.filter,
+                queue_len=len(self.queue),
+                autoplay=self.autoplay,
+            )
+            view = NowPlayingView(self)
+            edited = False
+            # One panel message per player: edit it in place — loop repeats and
+            # each next track update the same message instead of posting a new one.
+            if self._np_message is not None:
+                if self._np_message.channel.id != getattr(self._notice_channel, "id", None):
+                    self._np_message = None
+                else:
+                    try:
+                        await self._np_message.edit(embed=e, view=view)
+                        edited = True
+                    except discord.NotFound:
+                        self._np_message = None
+                    except Exception:
+                        self._np_message = None
+            if not edited:
+                try:
+                    self._np_message = await self._notice_channel.send(embed=e, view=view)
+                except Exception:
+                    self._np_message = None
         if settings.get("songstatus", True):
             await self._update_song_status(track)
 

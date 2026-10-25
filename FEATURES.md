@@ -53,7 +53,7 @@ Legend: ✅ implemented · ➖ equivalent alternative · 🔜 planned (phase 3)
 | skip (direct + vote) | ✅ | Flavi thresholds; DJ/alone bypass |
 | jump (skipto) | ✅ | first-class `/jump <position>` — straight to that queued track |
 | queue (pagination) | ✅ | buttons Previous/Next/Close |
-| nowplaying (+buttons) | ✅ | compact 5-button panel under /play; full 10-button panel via `/panel` |
+| nowplaying (+buttons) | ✅ | one panel message per player — edits in place (no spam on loops); rectangle 3×4 buttons + filter dropdown everywhere |
 | songinfo | ✅ | artist / duration / source (YouTube / SoundCloud / radio) / position |
 | clear / stop / disconnect / join / moveme | ✅ | |
 | volume 1–200 | ✅ | seamless ffmpeg restart; persists per server as default volume |

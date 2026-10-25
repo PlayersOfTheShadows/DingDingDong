@@ -229,7 +229,7 @@ class Settings(commands.Cog):
                 "**Queue & tuning**\n"
                 "`queue` `nowplaying` `songinfo` `history` `shuffle` `move` `remove` `volume` `loop` `seek` `forward` `rewind` `filter`\n\n"
                 "**AI**\n"
-                "`ai` `ai channel` `ai ask` `ai model` `recommend` — or just talk in the AI channel\n\n"
+                "`ai` `ai channel` `ai model` `recommend` — or just talk in the AI channel (it replies to every message)\n\n"
                 "**Extras**\n"
                 "`autoplay` `24-7` `lyrics` `radios` `panel` `clean` `ping` `stats`\n\n"
                 "**Playlists**\n"

@@ -65,6 +65,12 @@ YTDLP_COOKIES_FROM_BROWSER = (os.getenv("YTDLP_COOKIES_FROM_BROWSER") or "").str
 # file into the project folder (e.g. cookies.txt next to main.py) and set
 # YTDLP_COOKIE_FILE=cookies.txt (absolute paths work too). NEVER commit it.
 YTDLP_COOKIE_FILE = (os.getenv("YTDLP_COOKIE_FILE") or "").strip()
+if not YTDLP_COOKIE_FILE:
+    # Auto-detect a cookies.txt dropped next to main.py — the cookie-sync
+    # tooling uploads it here automatically, so zero configuration is needed.
+    _auto_cookies = BASE_DIR / "cookies.txt"
+    if _auto_cookies.exists():
+        YTDLP_COOKIE_FILE = str(_auto_cookies)
 
 # ---- AI (Groq primary, Google Gemini fallback) ----
 # Both providers are tried in order; whichever answers first wins. If the
