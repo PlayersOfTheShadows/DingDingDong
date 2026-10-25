@@ -419,7 +419,9 @@ class GuildPlayer:
             except StreamError:
                 fallback = None
                 try:
-                    fallback = await self.bot.resolver.sc_fallback(track)
+                    fallback = await self.bot.resolver.sc_fallback(
+                        track, query_hint=getattr(track, "query", "") or None
+                    )
                 except Exception:
                     log.debug("soundcloud fallback lookup failed", exc_info=True)
                 if fallback is None:

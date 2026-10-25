@@ -78,6 +78,20 @@ if not YTDLP_COOKIE_FILE:
 # cookies.txt resets it instantly, and a restart clears it too.
 YOUTUBE_BREAK_SECONDS = _int("YOUTUBE_BREAK_SECONDS", 43200)
 
+
+def _bool(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on", "y")
+
+
+#: Search SoundCloud first for text queries (fast, no YouTube wall) and only
+#: fall back to YouTube if it has nothing. YouTube URLs are unaffected. This is
+#: the SoundCloud-first model the user's reference bot uses — best on hosts that
+#: cannot get YouTube formats at all.
+PREFER_SOUNDCLOUD = _bool("PREFER_SOUNDCLOUD", False)
+
 #: Hard ceiling for one YouTube stream resolution. Shared/CPU-throttled hosts
 #: can take minutes where a home connection takes seconds; past this we give up
 #: and let the SoundCloud path serve the track quickly instead of stalling.

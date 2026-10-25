@@ -184,12 +184,21 @@ class AICog(commands.Cog):
                 raise UserError("I need a song name to play.")
             await need_voice()
             kind, tracks = "track", []
-            try:
-                kind, tracks = await self.bot.resolver.resolve(query, requester=member)
-            except Exception:  # noqa: BLE001
-                sc = await self.bot.resolver.sc_search(query, requester=member)
-                if sc is not None:
-                    kind, tracks = "track", [sc]
+            if config.PREFER_SOUNDCLOUD and not self.bot.resolver.is_url(query):
+                sc_first = None
+                try:
+                    sc_first = await self.bot.resolver.sc_search(query, requester=member)
+                except Exception:  # noqa: BLE001
+                    log.debug("soundcloud-first search failed", exc_info=True)
+                if sc_first is not None:
+                    kind, tracks = "track", [sc_first]
+            if not tracks:
+                try:
+                    kind, tracks = await self.bot.resolver.resolve(query, requester=member)
+                except Exception:  # noqa: BLE001
+                    sc = await self.bot.resolver.sc_search(query, requester=member)
+                    if sc is not None:
+                        kind, tracks = "track", [sc]
             if not tracks:
                 raise UserError(f"Couldn't find anything playable for `{sanitize(query, 60)}`.")
             if kind == "playlist":

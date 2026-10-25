@@ -212,24 +212,38 @@ class Music(commands.Cog):
         player = self._player(ctx)
         await self._ensure_player_voice(ctx, player)
         was_idle = player.current is None and not (player.is_playing or player.is_paused)
-        try:
-            kind, tracks = await self.bot.resolver.resolve(query, requester=ctx.author)
-        except UnsupportedPlatform as exc:
-            raise UserError(str(exc)) from exc
-        except ExtractError as exc:
-            # YouTube search itself can be bot-walled (common on hosting IPs) —
-            # rescue the raw query through SoundCloud before giving up.
-            sc_track = None
+        kind, tracks = "track", []
+        if config.PREFER_SOUNDCLOUD and not self.bot.resolver.is_url(query):
+            # SoundCloud-first: answer a text query in seconds instead of paying
+            # YouTube's search + wall on every play (this is the model the
+            # SoundCloud-first bots use)
+            sc_first = None
             try:
-                sc_track = await self.bot.resolver.sc_search(query, requester=ctx.author)
+                sc_first = await self.bot.resolver.sc_search(query, requester=ctx.author)
             except Exception:  # noqa: BLE001
-                pass
-            if sc_track is None:
-                raise UserError(
-                    f"Couldn't find anything playable for `{sanitize(query, 60)}`. {friendly_stream_error(str(exc))}"
-                ) from exc
-            kind, tracks = "track", [sc_track]
-            log.info("youtube search failed — silently using soundcloud match %r", sc_track.title)
+                log.debug("soundcloud-first search failed", exc_info=True)
+            if sc_first is not None:
+                kind, tracks = "track", [sc_first]
+                log.info("soundcloud-first: matched %r for %r", sc_first.title, query)
+        if not tracks:
+            try:
+                kind, tracks = await self.bot.resolver.resolve(query, requester=ctx.author)
+            except UnsupportedPlatform as exc:
+                raise UserError(str(exc)) from exc
+            except ExtractError as exc:
+                # YouTube search itself can be bot-walled (common on hosting IPs) —
+                # rescue the raw query through SoundCloud before giving up.
+                sc_track = None
+                try:
+                    sc_track = await self.bot.resolver.sc_search(query, requester=ctx.author)
+                except Exception:  # noqa: BLE001
+                    pass
+                if sc_track is None:
+                    raise UserError(
+                        f"Couldn't find anything playable for `{sanitize(query, 60)}`. {friendly_stream_error(str(exc))}"
+                    ) from exc
+                kind, tracks = "track", [sc_track]
+                log.info("youtube search failed — silently using soundcloud match %r", sc_track.title)
         if kind == "track":
             track = tracks[0]
             pos = player.enqueue(track, insert_first=insert_first or then_skip)

@@ -146,6 +146,10 @@ class Track:
     stream_at: float = 0.0
     http_headers: dict = field(default_factory=dict)
     fallback_done: bool = False
+    #: the words the listener actually typed, kept so the SoundCloud rescue can
+    #: search those instead of a meme/skit video title ("I am not built for
+    #: playing granny. avascreams" finds nothing; "granny jumpscare" does)
+    query: str = ""
 
     # ---------------- construction ----------------
 
@@ -501,7 +505,9 @@ class Resolver:
         out = []
         for entry in info.get("entries", []):
             if entry.get("title"):
-                out.append(Track.from_info(entry))
+                track = Track.from_info(entry)
+                track.query = query
+                out.append(track)
         return out
 
     async def resolve(
@@ -522,7 +528,9 @@ class Resolver:
         entries = info.get("entries") or []
         if not entries:
             raise ExtractError(f"No results for `{q}`.")
-        return "track", [Track.from_info(entries[0], requester=requester)]
+        track = Track.from_info(entries[0], requester=requester)
+        track.query = q
+        return "track", [track]
 
     async def _resolve_url(self, url: str, *, requester, playlist_limit: int) -> tuple[str, list["Track"]]:
         low = url.lower()
@@ -886,18 +894,37 @@ class Resolver:
                 self._suggest_cache.pop(key, None)
         return out
 
-    async def sc_fallback(self, track: "Track") -> Optional["Track"]:
-        """SoundCloud rescue for one specific track that YouTube refused."""
-        query = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", track.title or "")
-        query = re.sub(r"\s+", " ", query).strip(" -–—|")
-        if track.uploader and track.uploader.lower() not in query.lower():
-            query = f"{query} {track.uploader}".strip()
-        return await self.sc_search(
-            query,
-            target_duration=track.duration,
-            requester_id=track.requester_id,
-            requester_name=track.requester_name,
-        )
+    async def sc_fallback(self, track: "Track", *, query_hint: Optional[str] = None) -> Optional["Track"]:
+        """SoundCloud rescue for one specific track that YouTube refused.
+
+        Tries the listener's own words before the video title: a meme/skit title
+        rarely exists on SoundCloud, but the words people type usually do — that
+        is exactly how SoundCloud-first bots answer "granny jumpscare".
+        """
+        candidates: list[str] = []
+        for raw in (query_hint, getattr(track, "query", ""), track.title or ""):
+            text = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", str(raw or ""))
+            text = re.sub(r"\s+", " ", text).strip(" -–—|")
+            if text and text.lower() not in [c.lower() for c in candidates]:
+                candidates.append(text)
+        if track.uploader and candidates:
+            with_uploader = f"{candidates[-1]} {track.uploader}".strip()
+            if with_uploader.lower() not in [c.lower() for c in candidates]:
+                candidates.append(with_uploader)
+        for cand in candidates:
+            try:
+                found = await self.sc_search(
+                    cand,
+                    target_duration=track.duration,
+                    requester_id=track.requester_id,
+                    requester_name=track.requester_name,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("soundcloud rescue failed for %r: %r", cand, exc)
+                continue
+            if found is not None:
+                return found
+        return None
 
     # ---------------- download fallback ----------------
 
