@@ -241,6 +241,10 @@ class Resolver:
         self._stream_cache: dict[str, tuple[float, str, dict]] = {}
         #: set once a cookieless attempt wins after a cookie one returned nothing
         self._cookies_stale = False
+        #: consecutive resolves that ended with no usable YouTube audio — two of
+        #: those in a row means this host simply cannot get formats (seen on
+        #: shared/datacenter IPs) and we should stop paying for the attempt
+        self._yt_dead_streak = 0
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ytdlp")
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
@@ -607,6 +611,7 @@ class Resolver:
             hit = self._cache_get(track)
             if hit is not None:
                 log.debug("stream cache hit for %r", track.title)
+                self._yt_dead_streak = 0
                 return hit[0], hit[1], {}
         target = track.source_url
         if not target:
@@ -635,6 +640,7 @@ class Resolver:
                         "youtube resolution exceeded the %.0fs budget — switching to soundcloud",
                         budget if budget is not None else config.YT_BUDGET_SECONDS,
                     )
+                    self._note_yt_unusable()
                     raise StreamError("youtube is too slow from this host right now — using soundcloud")
                 label = client or "(default)"
                 info: Optional[dict] = None
@@ -688,6 +694,7 @@ class Resolver:
                         pass_no, label, noformat_hits, empty_hits,
                     )
                     if noformat_hits >= 3 or empty_hits >= 2:
+                        self._note_yt_unusable()
                         raise StreamError("youtube served no playable audio for this video — using soundcloud")
                     continue
 
@@ -701,6 +708,7 @@ class Resolver:
                     self.working_client = client
                     log.info("using youtube player client: %s", label)
                 self._cache_put(track, url, headers)
+                self._yt_dead_streak = 0
                 return url, headers, info
             if pass_no == 1:
                 if self._is_permanent_error(str(last_err)):
@@ -708,6 +716,22 @@ class Resolver:
                 log.info("all clients failed once (%s) — retrying top clients", last_err)
                 await asyncio.sleep(2.5)
         raise StreamError(f"no playable stream found ({last_err})")
+
+    def _note_yt_unusable(self) -> None:
+        """Two consecutive YouTube resolutions with nothing playable means the
+        host itself cannot get formats, so open the breaker and serve SoundCloud
+        for the rest of the window instead of re-paying the attempt every play.
+        A fresh cookies.txt or a restart clears it, so a re-export retries at once.
+        """
+        self._yt_dead_streak += 1
+        if self._yt_dead_streak >= 2 and not self.yt_blocked():
+            log.warning(
+                "youtube yielded no playable formats twice in a row from this host — "
+                "serving soundcloud for the next %d h (re-export cookies.txt or restart "
+                "to retry youtube immediately)",
+                int(config.YOUTUBE_BREAK_SECONDS // 3600),
+            )
+            self._trip_breaker("no playable formats from this host")
 
     async def _sc_candidates(self, query: str) -> list["Track"]:
         """Raw SoundCloud candidates, trying progressively simpler query
