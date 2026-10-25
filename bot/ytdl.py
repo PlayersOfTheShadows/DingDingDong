@@ -82,8 +82,33 @@ def _clean_error(text: str) -> str:
 
 class _QuietYDL:
     """Route yt-dlp's own messages into our logger instead of letting
-    `ERROR: [youtube] …` lines land in the bot console. The bot reports what
-    matters itself (and switches platforms silently)."""
+    `ERROR: [youtube] …` lines land in the bot console.
+
+    It also records yt-dlp's own verdict when the YouTube account cookies have
+    been invalidated ("no longer valid / rotated in the browser"). That is the
+    authoritative signal — inferring it from a single video's missing formats
+    gives false positives, because some videos legitimately serve no playable
+    formats to a signed-in session.
+    """
+
+    #: True once yt-dlp reports the cookie set as rotated/invalid
+    cookies_invalid = False
+    #: so the operator is told once per process, not once per extraction
+    _told = False
+
+    @staticmethod
+    def _note(text: str) -> bool:
+        low = text.lower()
+        if "no longer valid" in low or "rotated in the browser" in low:
+            _QuietYDL.cookies_invalid = True
+            if not _QuietYDL._told:
+                _QuietYDL._told = True
+                log.warning(
+                    "yt-dlp says the saved YouTube cookies are no longer valid "
+                    "(rotated) — re-export cookies.txt from the browser to restore YouTube"
+                )
+            return True
+        return False
 
     def debug(self, msg) -> None:
         text = str(msg)
@@ -94,10 +119,12 @@ class _QuietYDL:
         log.debug("yt-dlp %s", msg)
 
     def warning(self, msg) -> None:
-        log.debug("yt-dlp warning: %s", msg)
+        if not self._note(str(msg)):
+            log.debug("yt-dlp warning: %s", msg)
 
     def error(self, msg) -> None:
-        log.debug("yt-dlp error: %s", msg)
+        if not self._note(str(msg)):
+            log.debug("yt-dlp error: %s", msg)
 
 
 _QUIET_YDL = _QuietYDL()
@@ -638,15 +665,14 @@ class Resolver:
                         continue
                     if (candidate or {}).get("url"):
                         info = candidate
-                        if use_cookies is False and not self._cookies_stale:
+                        # authoritative cookie health, straight from yt-dlp — a
+                        # single video with no playable formats is NOT proof that
+                        # the cookies are bad (and on a bot-walled host abandoning
+                        # them would break everything)
+                        if _QUIET_YDL.cookies_invalid:
                             self._cookies_stale = True
-                            log.warning(
-                                "the saved cookies look rotated/stale (signed-in sessions get no "
-                                "playable formats) — re-export cookies.txt to restore YouTube; "
-                                "leading with the cookieless attempt meanwhile"
-                            )
                         elif use_cookies is None and self._cookies_stale:
-                            self._cookies_stale = False  # cookies healthy again
+                            self._cookies_stale = False  # cookies work again
                         break
                 url = (info or {}).get("url")
 
